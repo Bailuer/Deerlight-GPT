@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local datasets
+data/input.txt
+data/*.bin
+
+# Model artifacts and experiment output
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+runs/
+wandb/
+
+# Local secrets and configuration
+.env
+.env.*
+
