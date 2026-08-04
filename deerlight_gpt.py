@@ -42,26 +42,51 @@ def build_vocabulary(
     text: str,
 ) -> tuple[list[str], dict[str, int], dict[int, str]]:
     """Return Characters, string-to-integer mapping, and inverse mapping."""
-    # TODO: Implement the Character Vocabulary and both mappings.
-    raise NotImplementedError
+    characters = sorted(list(set(text)))
+
+    stoi = {}
+    itos = {}
+
+    for index, character in enumerate(characters):
+        stoi[character] = index
+        itos[index] = character
+
+    return characters, stoi, itos
 
 
 def encode(text: str, stoi: dict[str, int]) -> list[int]:
     """Convert a String into a list of Token IDs."""
-    # TODO: Implement Encoding.
-    raise NotImplementedError
+    token_ids = []
+
+    for character in text:
+        token_id = stoi[character]
+        token_ids.append(token_id)
+
+    return token_ids
 
 
 def decode(token_ids: list[int], itos: dict[int, str]) -> str:
     """Convert a list of Token IDs back into a String."""
-    # TODO: Implement Decoding.
-    raise NotImplementedError
+    characters = []
+
+    for token_id in token_ids:
+        character = itos[token_id]
+        characters.append(character)
+
+    text = "".join(characters)
+    return text
 
 
 def tokenize_dataset(text: str, stoi: dict[str, int]) -> Tensor:
     """Encode the complete Dataset as a one-dimensional torch.long Tensor."""
-    # TODO: Encode the Dataset and convert it to the required Tensor.
-    raise NotImplementedError
+    token_ids = encode(text, stoi)
+
+    data = torch.tensor(
+        token_ids,
+        dtype=torch.long,
+    )
+
+    return data
 
 
 def split_dataset(
@@ -69,8 +94,14 @@ def split_dataset(
     train_fraction: float,
 ) -> tuple[Tensor, Tensor]:
     """Split Token IDs into Training and Validation Sets."""
-    # TODO: Use the first part for Training and the remainder for Validation.
-    raise NotImplementedError
+    split_index = int(
+        len(data) * train_fraction
+    )
+
+    train_data = data[:split_index]
+    validation_data = data[split_index:]
+
+    return train_data, validation_data
 
 
 def get_batch(
@@ -81,11 +112,46 @@ def get_batch(
     block_size: int,
 ) -> tuple[Tensor, Tensor]:
     """Return a random Batch of Inputs and one-token-shifted Targets."""
-    # TODO: Select the requested split.
-    # TODO: Sample random valid starting positions.
-    # TODO: Construct x with Shape (batch_size, block_size).
-    # TODO: Construct y by shifting every Sequence forward by one Token.
-    raise NotImplementedError
+    # 1. Select Dataset
+    if split == "train":
+        source = train_data
+    elif split == "validation":
+        source = validation_data
+    else:
+        raise ValueError(
+            "Split Must be 'train' or 'validation'"
+        )
+
+    # 2. Generate random starting positions
+    start_indices = torch.randint(
+        low=0,
+        high=len(source) - block_size,
+        size=(batch_size,),
+    )
+
+    x_sequences = []
+    y_sequences = []
+
+    # 3. Construct every Sequence
+    for start_index in start_indices:
+        start = start_index.item()
+
+        x_sequence = source[
+            start:start + block_size
+        ]
+
+        y_sequence = source[
+            start + 1:start + block_size + 1
+        ]
+
+        x_sequences.append(x_sequence)
+        y_sequences.append(y_sequence)
+
+    # 4. Combine Sequences into Batches
+    x = torch.stack(x_sequences)
+    y = torch.stack(y_sequences)
+
+    return x, y
 
 
 # -----------------------------------------------------------------------------

@@ -30,9 +30,9 @@ The first working version will use:
 
 ### Baseline Deerlight GPT
 
-- [ ] Character-level Tokenizer
-- [ ] Training and Validation Split
-- [ ] Shifted Training Batches
+- [x] Character-level Tokenizer
+- [x] Training and Validation Split
+- [x] Shifted Training Batches
 - [ ] Bigram Language Model
 - [ ] Single-Head Self-Attention
 - [ ] Multi-Head Self-Attention
@@ -94,5 +94,4 @@ python deerlight_gpt.py
 
 ## Current Milestone
 
-Milestone 1: implement and verify the Character-level Tokenizer and shifted Batch Data Pipeline.
-
+Milestone 1 complete: Character-level Tokenizer and shifted Batch Data Pipeline verified on Tiny Shakespeare.
