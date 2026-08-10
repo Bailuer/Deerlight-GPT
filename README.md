@@ -35,8 +35,8 @@ The first working version will use:
 - [x] Shifted Training Batches
 - [x] Bigram Language Model
 - [x] Single-Head Self-Attention
-- [ ] Multi-Head Self-Attention
-- [ ] Transformer Block
+- [x] Multi-Head Self-Attention
+- [x] Transformer Block
 - [ ] Decoder-only GPT
 - [ ] Training Loop
 - [ ] Autoregressive Generation
@@ -94,4 +94,4 @@ python deerlight_gpt.py
 
 ## Current Milestone
 
-Milestone 4 in progress: combine independent Causal Attention Heads and verify their Tensor shapes.
+Milestone 6 in progress: assemble the complete Decoder-only Deerlight GPT and verify end-to-end Tensor flow.

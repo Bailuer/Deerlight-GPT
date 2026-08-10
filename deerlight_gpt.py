@@ -27,6 +27,8 @@ GENERATION_LENGTH = 500
 EMBEDDING_DIM = 32
 HEAD_SIZE = 16
 NUM_HEADS = 4
+FEED_FORWARD_EXPANSION = 4
+NUM_LAYERS = 2
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DATA_PATH = PROJECT_DIR / "data" / "input.txt"
@@ -585,6 +587,332 @@ def verify_multi_head_attention() -> None:
 
 
 # -----------------------------------------------------------------------------
+# Milestone 5: Transformer Block
+# -----------------------------------------------------------------------------
+
+class FeedForwardNetwork(nn.Module):
+    """Process every Token independently with a nonlinear MLP.
+
+    Input and Output Shape:
+        (batch_size, time, embedding_dim)
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        expansion_factor: int,
+    ) -> None:
+        super().__init__()
+
+        if expansion_factor <= 0:
+            raise ValueError("Feed-Forward Expansion Factor must be positive.")
+
+        hidden_dim = expansion_factor * embedding_dim
+
+        self.network = nn.Sequential(
+            nn.Linear(
+                in_features=embedding_dim,
+                out_features=hidden_dim,
+            ),
+            nn.GELU(),
+            nn.Linear(
+                in_features=hidden_dim,
+                out_features=embedding_dim,
+            ),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Apply the same MLP to every Token Vector."""
+        return self.network(x)
+
+
+class TransformerBlock(nn.Module):
+    """Combine Token communication and per-Token nonlinear processing.
+
+    This Block uses the Pre-LayerNorm layout:
+        x = x + Attention(LayerNorm(x))
+        x = x + FeedForward(LayerNorm(x))
+
+    Input and Output Shape:
+        (batch_size, time, embedding_dim)
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_heads: int,
+        block_size: int,
+        expansion_factor: int,
+    ) -> None:
+        super().__init__()
+
+        self.layer_norm_1 = nn.LayerNorm(embedding_dim)
+        self.attention = MultiHeadCausalSelfAttention(
+            embedding_dim=embedding_dim,
+            num_heads=num_heads,
+            block_size=block_size,
+        )
+
+        self.layer_norm_2 = nn.LayerNorm(embedding_dim)
+        self.feed_forward = FeedForwardNetwork(
+            embedding_dim=embedding_dim,
+            expansion_factor=expansion_factor,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Run the Attention and Feed-Forward Residual Branches."""
+        x = x + self.attention(
+            self.layer_norm_1(x)
+        )
+        x = x + self.feed_forward(
+            self.layer_norm_2(x)
+        )
+
+        return x
+
+
+def verify_transformer_block() -> None:
+    """Check Shape, Causality, finite values, and Gradient Flow."""
+    transformer_block = TransformerBlock(
+        embedding_dim=EMBEDDING_DIM,
+        num_heads=NUM_HEADS,
+        block_size=BLOCK_SIZE,
+        expansion_factor=FEED_FORWARD_EXPANSION,
+    )
+
+    sample = torch.randn(
+        2,
+        4,
+        EMBEDDING_DIM,
+    )
+
+    original_output = transformer_block(sample)
+
+    changed_sample = sample.clone()
+    changed_sample[:, 2:, :] = torch.randn_like(
+        changed_sample[:, 2:, :]
+    )
+    changed_output = transformer_block(changed_sample)
+
+    assert original_output.shape == sample.shape
+    assert torch.isfinite(original_output).all()
+    assert torch.allclose(
+        original_output[:, :2, :],
+        changed_output[:, :2, :],
+        atol=1e-6,
+    )
+
+    test_loss = original_output.square().mean()
+    test_loss.backward()
+
+    for parameter in transformer_block.parameters():
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+
+
+# -----------------------------------------------------------------------------
+# Milestone 6: Decoder-only Deerlight GPT
+# -----------------------------------------------------------------------------
+
+class DeerlightGPTLanguageModel(nn.Module):
+    """Predict the next Token with a stack of Causal Transformer Blocks."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        embedding_dim: int,
+        num_heads: int,
+        num_layers: int,
+        block_size: int,
+        expansion_factor: int,
+    ) -> None:
+        super().__init__()
+
+        if num_layers <= 0:
+            raise ValueError("Number of Transformer Layers must be positive.")
+
+        self.block_size = block_size
+        self.vocab_size = vocab_size
+
+        # Module 1: Represent both Token Identity and absolute Position.
+        self.token_embedding_table = nn.Embedding(
+            num_embeddings=vocab_size,
+            embedding_dim=embedding_dim,
+        )
+        self.position_embedding_table = nn.Embedding(
+            num_embeddings=block_size,
+            embedding_dim=embedding_dim,
+        )
+
+        # Module 2: Repeatedly refine every context-aware Token Vector.
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(
+                embedding_dim=embedding_dim,
+                num_heads=num_heads,
+                block_size=block_size,
+                expansion_factor=expansion_factor,
+            )
+            for _ in range(num_layers)
+        ])
+
+        # Module 3: Normalize the final internal Representation.
+        self.final_layer_norm = nn.LayerNorm(embedding_dim)
+
+        # Module 4: Convert each Token Vector into Vocabulary Logits.
+        self.language_model_head = nn.Linear(
+            in_features=embedding_dim,
+            out_features=vocab_size,
+        )
+
+    def forward(
+        self,
+        token_ids: Tensor,
+        targets: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Return next-Token Logits and optional Cross-Entropy Loss."""
+        if token_ids.ndim != 2:
+            raise ValueError(
+                "Token IDs must have Shape (batch_size, time)."
+            )
+
+        batch_size, time = token_ids.shape
+
+        if time > self.block_size:
+            raise ValueError(
+                f"Sequence Length {time} exceeds Block Size {self.block_size}."
+            )
+
+        # Module 1: Build position-aware Token Representations.
+        token_embeddings = self.token_embedding_table(token_ids)
+
+        position_ids = torch.arange(
+            time,
+            device=token_ids.device,
+        )
+        position_embeddings = self.position_embedding_table(position_ids)
+
+        x = token_embeddings + position_embeddings
+
+        # Module 2: Let all Transformer Blocks process the Sequence.
+        for transformer_block in self.transformer_blocks:
+            x = transformer_block(x)
+
+        # Module 3: Produce one Vocabulary Score per Token and Position.
+        x = self.final_layer_norm(x)
+        logits = self.language_model_head(x)
+
+        expected_shape = (batch_size, time, self.vocab_size)
+        if logits.shape != expected_shape:
+            raise RuntimeError(
+                f"GPT Logits Shape {tuple(logits.shape)} does not match "
+                f"the expected Shape {expected_shape}."
+            )
+
+        loss = None
+
+        if targets is not None:
+            if targets.shape != token_ids.shape:
+                raise ValueError(
+                    "Targets must have the same Shape as Token IDs."
+                )
+
+            flat_logits = logits.reshape(
+                batch_size * time,
+                self.vocab_size,
+            )
+            flat_targets = targets.reshape(
+                batch_size * time,
+            )
+
+            loss = F.cross_entropy(
+                flat_logits,
+                flat_targets,
+            )
+
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(
+        self,
+        token_ids: Tensor,
+        max_new_tokens: int,
+    ) -> Tensor:
+        """Autoregressively sample Tokens using at most block_size Context."""
+        for _ in range(max_new_tokens):
+            # Learned Position Embeddings only support block_size Positions.
+            context = token_ids[:, -self.block_size:]
+
+            logits, _ = self(context)
+            final_logits = logits[:, -1, :]
+            probabilities = F.softmax(
+                final_logits,
+                dim=-1,
+            )
+
+            next_token_id = torch.multinomial(
+                probabilities,
+                num_samples=1,
+            )
+            token_ids = torch.cat(
+                (token_ids, next_token_id),
+                dim=1,
+            )
+
+        return token_ids
+
+
+def verify_deerlight_gpt() -> None:
+    """Check GPT Shapes, Loss, Gradient Flow, and Context Cropping."""
+    vocab_size = 65
+
+    model = DeerlightGPTLanguageModel(
+        vocab_size=vocab_size,
+        embedding_dim=EMBEDDING_DIM,
+        num_heads=NUM_HEADS,
+        num_layers=NUM_LAYERS,
+        block_size=BLOCK_SIZE,
+        expansion_factor=FEED_FORWARD_EXPANSION,
+    )
+
+    token_ids = torch.randint(
+        low=0,
+        high=vocab_size,
+        size=(2, 8),
+    )
+    targets = torch.randint(
+        low=0,
+        high=vocab_size,
+        size=(2, 8),
+    )
+
+    logits, loss = model(token_ids, targets)
+
+    assert logits.shape == (2, 8, vocab_size)
+    assert torch.isfinite(logits).all()
+    assert loss is not None
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+
+    loss.backward()
+
+    for parameter in model.parameters():
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+
+    long_context = torch.randint(
+        low=0,
+        high=vocab_size,
+        size=(2, BLOCK_SIZE),
+    )
+    generated = model.generate(
+        token_ids=long_context,
+        max_new_tokens=2,
+    )
+
+    assert generated.shape == (2, BLOCK_SIZE + 2)
+
+
+# -----------------------------------------------------------------------------
 # Program Entry Point
 # -----------------------------------------------------------------------------
 
@@ -649,6 +977,12 @@ def main() -> None:
 
     verify_multi_head_attention()
     print("All Milestone 4 checks passed.")
+
+    verify_transformer_block()
+    print("All Milestone 5 checks passed.")
+
+    verify_deerlight_gpt()
+    print("All Milestone 6 checks passed.")
 
 
 if __name__ == "__main__":
