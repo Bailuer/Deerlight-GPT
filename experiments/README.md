@@ -10,3 +10,6 @@ Each experiment should record:
 - Result
 - Interpretation and limitations
 
+## Recorded Experiments
+
+- [Model Width: C=32 vs C=64](model-width-c32-vs-c64.md)

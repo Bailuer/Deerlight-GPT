@@ -37,7 +37,7 @@ The first working version will use:
 - [x] Single-Head Self-Attention
 - [x] Multi-Head Self-Attention
 - [x] Transformer Block
-- [ ] Decoder-only GPT
+- [x] Decoder-only GPT
 - [ ] Training Loop
 - [ ] Autoregressive Generation
 
@@ -92,6 +92,16 @@ The Dataset itself is ignored by Git by default. Record its source and license i
 python deerlight_gpt.py
 ```
 
+The training script automatically uses CUDA when a CUDA-enabled PyTorch build
+is available, and otherwise falls back to CPU.
+
+For the tested Windows + NVIDIA setup, install the CUDA-enabled PyTorch wheel
+inside the Virtual Environment before running Training:
+
+```powershell
+python -m pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cu130
+```
+
 ## Current Milestone
 
-Milestone 6 in progress: assemble the complete Decoder-only Deerlight GPT and verify end-to-end Tensor flow.
+Milestone 7 in progress: train Deerlight GPT end to end, evaluate Validation Loss, and compare generation with the Bigram Baseline.

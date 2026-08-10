@@ -24,11 +24,18 @@ LEARNING_RATE = 1e-2
 TRAINING_STEPS = 3000
 PRINT_INTERVAL = 300
 GENERATION_LENGTH = 500
-EMBEDDING_DIM = 32
+EMBEDDING_DIM = 64
 HEAD_SIZE = 16
 NUM_HEADS = 4
 FEED_FORWARD_EXPANSION = 4
 NUM_LAYERS = 2
+GPT_LEARNING_RATE = 3e-4
+GPT_TRAINING_STEPS = 3000
+GPT_EVAL_INTERVAL = 300
+GPT_EVAL_BATCHES = 20
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DATA_PATH = PROJECT_DIR / "data" / "input.txt"
@@ -913,12 +920,139 @@ def verify_deerlight_gpt() -> None:
 
 
 # -----------------------------------------------------------------------------
+# Milestone 7: Deerlight GPT Training and Evaluation
+# -----------------------------------------------------------------------------
+
+@torch.no_grad()
+def estimate_deerlight_gpt_losses(
+    model: DeerlightGPTLanguageModel,
+    train_data: Tensor,
+    validation_data: Tensor,
+    batch_size: int,
+    block_size: int,
+    evaluation_batches: int,
+) -> dict[str, float]:
+    """Average Training and Validation Loss over multiple random Batches."""
+    if evaluation_batches <= 0:
+        raise ValueError("Number of Evaluation Batches must be positive.")
+
+    was_training = model.training
+    model.eval()
+    model_device = next(model.parameters()).device
+
+    estimated_losses = {}
+
+    for split in ("train", "validation"):
+        batch_losses = torch.zeros(evaluation_batches)
+
+        for batch_index in range(evaluation_batches):
+            x_batch, y_batch = get_batch(
+                split=split,
+                train_data=train_data,
+                validation_data=validation_data,
+                batch_size=batch_size,
+                block_size=block_size,
+            )
+            x_batch = x_batch.to(model_device)
+            y_batch = y_batch.to(model_device)
+
+            _, loss = model(x_batch, y_batch)
+
+            if loss is None:
+                raise RuntimeError(
+                    "Evaluation Loss is None. Check the GPT Forward Pass."
+                )
+
+            batch_losses[batch_index] = loss.item()
+
+        estimated_losses[split] = batch_losses.mean().item()
+
+    model.train(was_training)
+    return estimated_losses
+
+
+def train_deerlight_gpt(
+    model: DeerlightGPTLanguageModel,
+    train_data: Tensor,
+    validation_data: Tensor,
+    learning_rate: float,
+    training_steps: int,
+    evaluation_interval: int,
+    evaluation_batches: int,
+    batch_size: int,
+    block_size: int,
+) -> None:
+    """Train every Deerlight GPT Parameter end to end with AdamW."""
+    if training_steps <= 0:
+        raise ValueError("Number of Training Steps must be positive.")
+
+    if evaluation_interval <= 0:
+        raise ValueError("Evaluation Interval must be positive.")
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+    )
+
+    model.train()
+    model_device = next(model.parameters()).device
+
+    for step in range(1, training_steps + 1):
+        x_batch, y_batch = get_batch(
+            split="train",
+            train_data=train_data,
+            validation_data=validation_data,
+            batch_size=batch_size,
+            block_size=block_size,
+        )
+        x_batch = x_batch.to(model_device)
+        y_batch = y_batch.to(model_device)
+
+        _, training_loss = model(x_batch, y_batch)
+
+        if training_loss is None:
+            raise RuntimeError(
+                "Training Loss is None. Check the GPT Forward Pass."
+            )
+
+        optimizer.zero_grad(set_to_none=True)
+        training_loss.backward()
+        optimizer.step()
+
+        should_evaluate = (
+            step == 1
+            or step % evaluation_interval == 0
+            or step == training_steps
+        )
+
+        if should_evaluate:
+            losses = estimate_deerlight_gpt_losses(
+                model=model,
+                train_data=train_data,
+                validation_data=validation_data,
+                batch_size=batch_size,
+                block_size=block_size,
+                evaluation_batches=evaluation_batches,
+            )
+
+            print(
+                f"Step {step:4d}/{training_steps} | "
+                f"Training Loss: {losses['train']:.4f} | "
+                f"Validation Loss: {losses['validation']:.4f}"
+            )
+
+
+# -----------------------------------------------------------------------------
 # Program Entry Point
 # -----------------------------------------------------------------------------
 
 
 def main() -> None:
     torch.manual_seed(SEED)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+        torch.set_float32_matmul_precision("high")
 
     text = load_text(DATA_PATH)
     characters, stoi, itos = build_vocabulary(text)
@@ -956,22 +1090,6 @@ def main() -> None:
     print(decode(y_batch[0].tolist(), itos))
     print("\nAll Milestone 1 checks passed.")
 
-    model = BigramLanguageModel(vocab_size=len(characters))
-    train_bigram_model(
-        model=model,
-        train_data=train_data,
-        validation_data=validation_data,
-    )
-
-    initial_context = torch.zeros((1, 1), dtype=torch.long)
-    generated_token_ids = model.generate(
-        token_ids=initial_context,
-        max_new_tokens=GENERATION_LENGTH,
-    )
-
-    print("\nGenerated Text:")
-    print(decode(generated_token_ids[0].tolist(), itos))
-
     verify_single_head_attention()
     print("\nAll Milestone 3 checks passed.")
 
@@ -983,6 +1101,60 @@ def main() -> None:
 
     verify_deerlight_gpt()
     print("All Milestone 6 checks passed.")
+
+    # Reset the Random Seed so verification does not affect Training.
+    torch.manual_seed(SEED)
+
+    model = DeerlightGPTLanguageModel(
+        vocab_size=len(characters),
+        embedding_dim=EMBEDDING_DIM,
+        num_heads=NUM_HEADS,
+        num_layers=NUM_LAYERS,
+        block_size=BLOCK_SIZE,
+        expansion_factor=FEED_FORWARD_EXPANSION,
+    ).to(DEVICE)
+
+    parameter_count = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+    )
+    print(f"\nDeerlight GPT Parameters: {parameter_count:,}")
+    print(f"Training Device: {DEVICE}")
+
+    if DEVICE.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(DEVICE)}")
+
+    print("\nTraining Deerlight GPT...")
+
+    train_deerlight_gpt(
+        model=model,
+        train_data=train_data,
+        validation_data=validation_data,
+        learning_rate=GPT_LEARNING_RATE,
+        training_steps=GPT_TRAINING_STEPS,
+        evaluation_interval=GPT_EVAL_INTERVAL,
+        evaluation_batches=GPT_EVAL_BATCHES,
+        batch_size=BATCH_SIZE,
+        block_size=BLOCK_SIZE,
+    )
+
+    initial_context = torch.zeros(
+        (1, 1),
+        dtype=torch.long,
+        device=DEVICE,
+    )
+    generated_token_ids = model.generate(
+        token_ids=initial_context,
+        max_new_tokens=GENERATION_LENGTH,
+    )
+
+    print("\nGenerated Text:")
+    print(
+        decode(
+            generated_token_ids[0].detach().cpu().tolist(),
+            itos,
+        )
+    )
 
 
 if __name__ == "__main__":
