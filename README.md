@@ -33,8 +33,8 @@ The first working version will use:
 - [x] Character-level Tokenizer
 - [x] Training and Validation Split
 - [x] Shifted Training Batches
-- [ ] Bigram Language Model
-- [ ] Single-Head Self-Attention
+- [x] Bigram Language Model
+- [x] Single-Head Self-Attention
 - [ ] Multi-Head Self-Attention
 - [ ] Transformer Block
 - [ ] Decoder-only GPT
@@ -94,4 +94,4 @@ python deerlight_gpt.py
 
 ## Current Milestone
 
-Milestone 1 complete: Character-level Tokenizer and shifted Batch Data Pipeline verified on Tiny Shakespeare.
+Milestone 4 in progress: combine independent Causal Attention Heads and verify their Tensor shapes.
