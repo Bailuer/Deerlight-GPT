@@ -27,6 +27,7 @@ GENERATION_LENGTH = 500
 EMBEDDING_DIM = 64
 HEAD_SIZE = 16
 NUM_HEADS = 4
+NUM_KV_HEADS = NUM_HEADS
 FEED_FORWARD_EXPANSION = 4
 NUM_LAYERS = 2
 GPT_LEARNING_RATE = 3e-4
@@ -553,11 +554,11 @@ def verify_single_head_attention() -> None:
 # Milestone 4: Multi-Head Causal Self-Attention
 # -----------------------------------------------------------------------------
 
-MultiHeadKVCache = tuple[HeadKVCache, ...]
+PackedKVCache = tuple[Tensor, Tensor]
 
 
 class MultiHeadCausalSelfAttention(nn.Module):
-    """Run multiple Causal Attention Heads and combine their Outputs.
+    """Run packed MHA, GQA, or MQA with an unexpanded KV Cache.
 
     Input Shape:
         x: (batch_size, time, embedding_dim)
@@ -571,30 +572,51 @@ class MultiHeadCausalSelfAttention(nn.Module):
         embedding_dim: int,
         num_heads: int,
         block_size: int,
+        num_kv_heads: int | None = None,
     ) -> None:
         super().__init__()
 
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+
         if num_heads <= 0:
-            raise ValueError("Number of Attention Heads must be positive.")
+            raise ValueError("Number of Query Heads must be positive.")
+
+        if num_kv_heads <= 0:
+            raise ValueError("Number of KV Heads must be positive.")
 
         if embedding_dim % num_heads != 0:
             raise ValueError(
-                "Embedding Dimension must be divisible by Number of Heads."
+                "Embedding Dimension must be divisible by Number of Query Heads."
+            )
+
+        if num_heads % num_kv_heads != 0:
+            raise ValueError(
+                "Number of Query Heads must be divisible by Number of KV Heads."
             )
 
         self.embedding_dim = embedding_dim
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_size = embedding_dim // num_heads
+        self.queries_per_kv_head = num_heads // num_kv_heads
 
-        # Module 1: Create independent Attention Heads.
-        self.heads = nn.ModuleList([
-            CausalSelfAttentionHead(
-                embedding_dim=embedding_dim,
-                head_size=self.head_size,
-                block_size=block_size,
-            )
-            for _ in range(num_heads)
-        ])
+        # Module 1: Project all Query Heads and the smaller set of KV Heads.
+        self.query_projection = nn.Linear(
+            in_features=embedding_dim,
+            out_features=num_heads * self.head_size,
+            bias=False,
+        )
+        self.key_projection = nn.Linear(
+            in_features=embedding_dim,
+            out_features=num_kv_heads * self.head_size,
+            bias=False,
+        )
+        self.value_projection = nn.Linear(
+            in_features=embedding_dim,
+            out_features=num_kv_heads * self.head_size,
+            bias=False,
+        )
 
         # Module 2: Mix the concatenated Head Features back into Model Space.
         self.output_projection = nn.Linear(
@@ -602,127 +624,194 @@ class MultiHeadCausalSelfAttention(nn.Module):
             out_features=embedding_dim,
         )
 
+        self.register_buffer(
+            "causal_mask",
+            torch.tril(
+                torch.ones(
+                    block_size,
+                    block_size,
+                    dtype=torch.bool,
+                )
+            ),
+        )
+
     def forward(
         self,
         x: Tensor,
-        past_key_values: MultiHeadKVCache | None = None,
+        past_key_value: PackedKVCache | None = None,
         use_cache: bool = False,
-    ) -> tuple[Tensor, MultiHeadKVCache | None]:
-        """Return the combined Head Output and optional per-Head KV Caches."""
-        batch_size, time, _ = x.shape
+    ) -> tuple[Tensor, PackedKVCache | None]:
+        """Return combined Query-Head Outputs and an optional packed KV Cache."""
+        batch_size, query_time, _ = x.shape
 
-        if (
-            past_key_values is not None
-            and len(past_key_values) != self.num_heads
-        ):
+        # Shapes: Q=(B, num_heads, Tq, H), K/V=(B, num_kv_heads, Tq, H)
+        queries = self.query_projection(x).view(
+            batch_size,
+            query_time,
+            self.num_heads,
+            self.head_size,
+        ).transpose(1, 2)
+        new_keys = self.key_projection(x).view(
+            batch_size,
+            query_time,
+            self.num_kv_heads,
+            self.head_size,
+        ).transpose(1, 2)
+        new_values = self.value_projection(x).view(
+            batch_size,
+            query_time,
+            self.num_kv_heads,
+            self.head_size,
+        ).transpose(1, 2)
+
+        past_length = 0
+
+        if past_key_value is not None:
+            past_keys, past_values = past_key_value
+
+            if past_keys.shape != past_values.shape:
+                raise ValueError("Cached Keys and Values must have the same Shape.")
+
+            expected_cache_prefix = (
+                batch_size,
+                self.num_kv_heads,
+            )
+
+            if (
+                past_keys.ndim != 4
+                or past_keys.shape[:2] != expected_cache_prefix
+                or past_keys.shape[3] != self.head_size
+            ):
+                raise ValueError(
+                    "Packed KV Cache must have Shape "
+                    "(batch_size, num_kv_heads, past_time, head_size)."
+                )
+
+            past_length = past_keys.shape[2]
+            keys = torch.cat((past_keys, new_keys), dim=2)
+            values = torch.cat((past_values, new_values), dim=2)
+        else:
+            keys = new_keys
+            values = new_values
+
+        key_time = keys.shape[2]
+
+        if key_time > self.causal_mask.shape[0]:
             raise ValueError(
-                "Multi-Head KV Cache must contain one Cache per Attention Head."
+                f"Cached Sequence Length {key_time} exceeds Block Size "
+                f"{self.causal_mask.shape[0]}."
             )
 
-        # Module 3: Give the same Input to every Attention Head.
-        head_outputs = []
-        present_key_values = []
-
-        for head_index, head in enumerate(self.heads):
-            past_key_value = (
-                None
-                if past_key_values is None
-                else past_key_values[head_index]
-            )
-            head_output, present_key_value = head(
-                x,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-            )
-            head_outputs.append(head_output)
-
-            if use_cache:
-                if present_key_value is None:
-                    raise RuntimeError(
-                        "Attention Head did not return a requested KV Cache."
-                    )
-                present_key_values.append(present_key_value)
-
-        # Module 4: Join all Head Features along the final Dimension.
-        concatenated = torch.cat(
-            head_outputs,
-            dim=-1,
+        # Logically give every Query Head the KV Head assigned to its Group.
+        attention_keys = keys.repeat_interleave(
+            self.queries_per_kv_head,
+            dim=1,
+        )
+        attention_values = values.repeat_interleave(
+            self.queries_per_kv_head,
+            dim=1,
         )
 
-        # Module 5: Learn how to combine information from different Heads.
+        # Shape: (B, num_heads, query_time, key_time)
+        attention_scores = queries @ attention_keys.transpose(-2, -1)
+        attention_scores = attention_scores * (self.head_size ** -0.5)
+
+        active_mask = self.causal_mask[
+            past_length:past_length + query_time,
+            :key_time,
+        ]
+        attention_scores = attention_scores.masked_fill(
+            ~active_mask,
+            float("-inf"),
+        )
+        attention_weights = F.softmax(attention_scores, dim=-1)
+
+        # Preserve all Query-Head Outputs even when K/V are shared.
+        head_outputs = attention_weights @ attention_values
+        concatenated = head_outputs.transpose(1, 2).contiguous().view(
+            batch_size,
+            query_time,
+            self.embedding_dim,
+        )
         output = self.output_projection(concatenated)
 
-        expected_shape = (batch_size, time, self.embedding_dim)
+        expected_shape = (batch_size, query_time, self.embedding_dim)
         if output.shape != expected_shape:
             raise RuntimeError(
                 f"Multi-Head Output Shape {tuple(output.shape)} does not match "
                 f"the expected Shape {expected_shape}."
             )
 
-        present = tuple(present_key_values) if use_cache else None
+        present = (keys, values) if use_cache else None
         return output, present
 
 
 def verify_multi_head_attention() -> None:
-    """Check Multi-Head Output Shape and Causal Information Flow."""
-    attention = MultiHeadCausalSelfAttention(
-        embedding_dim=EMBEDDING_DIM,
-        num_heads=NUM_HEADS,
-        block_size=BLOCK_SIZE,
-    )
-
+    """Check MHA/GQA/MQA Shapes, Causality, Cache size, and cached Decode."""
     sample = torch.randn(
         2,
         4,
         EMBEDDING_DIM,
     )
-
-    original_output, _ = attention(sample)
-
     changed_sample = sample.clone()
     changed_sample[:, 2:, :] = torch.randn_like(
         changed_sample[:, 2:, :]
     )
-    changed_output, _ = attention(changed_sample)
 
-    assert len(attention.heads) == NUM_HEADS
-    assert attention.head_size == EMBEDDING_DIM // NUM_HEADS
-    assert original_output.shape == (2, 4, EMBEDDING_DIM)
-    assert torch.isfinite(original_output).all()
-    assert torch.allclose(
-        original_output[:, :2, :],
-        changed_output[:, :2, :],
-        atol=1e-6,
-    )
+    cache_elements = {}
 
-    # Every Head owns an independent Cache during cached Decoding.
-    _, prefill_cache = attention(
-        sample[:, :3, :],
-        use_cache=True,
-    )
-    assert prefill_cache is not None
-    assert len(prefill_cache) == NUM_HEADS
+    for num_kv_heads in (NUM_HEADS, NUM_HEADS // 2, 1):
+        attention = MultiHeadCausalSelfAttention(
+            embedding_dim=EMBEDDING_DIM,
+            num_heads=NUM_HEADS,
+            num_kv_heads=num_kv_heads,
+            block_size=BLOCK_SIZE,
+        )
+        original_output, _ = attention(sample)
+        changed_output, _ = attention(changed_sample)
 
-    for keys, values in prefill_cache:
-        assert keys.shape == (2, 3, attention.head_size)
-        assert values.shape == (2, 3, attention.head_size)
+        assert attention.head_size == EMBEDDING_DIM // NUM_HEADS
+        assert attention.num_kv_heads == num_kv_heads
+        assert original_output.shape == (2, 4, EMBEDDING_DIM)
+        assert torch.isfinite(original_output).all()
+        assert torch.allclose(
+            original_output[:, :2, :],
+            changed_output[:, :2, :],
+            atol=1e-6,
+        )
 
-    cached_output, updated_cache = attention(
-        sample[:, 3:, :],
-        past_key_values=prefill_cache,
-        use_cache=True,
-    )
-    assert updated_cache is not None
+        _, prefill_cache = attention(
+            sample[:, :3, :],
+            use_cache=True,
+        )
+        assert prefill_cache is not None
+        keys, values = prefill_cache
+        expected_cache_shape = (
+            2,
+            num_kv_heads,
+            3,
+            attention.head_size,
+        )
+        assert keys.shape == expected_cache_shape
+        assert values.shape == expected_cache_shape
+        cache_elements[num_kv_heads] = keys.numel() + values.numel()
 
-    for keys, values in updated_cache:
-        assert keys.shape == (2, 4, attention.head_size)
-        assert values.shape == (2, 4, attention.head_size)
+        cached_output, updated_cache = attention(
+            sample[:, 3:, :],
+            past_key_value=prefill_cache,
+            use_cache=True,
+        )
+        assert updated_cache is not None
+        assert updated_cache[0].shape[2] == 4
+        assert updated_cache[1].shape[2] == 4
+        assert torch.allclose(
+            cached_output,
+            original_output[:, 3:, :],
+            atol=1e-6,
+        )
 
-    assert torch.allclose(
-        cached_output,
-        original_output[:, 3:, :],
-        atol=1e-6,
-    )
+    assert cache_elements[NUM_HEADS] == 2 * cache_elements[NUM_HEADS // 2]
+    assert cache_elements[NUM_HEADS] == 4 * cache_elements[1]
 
 
 # -----------------------------------------------------------------------------
@@ -765,7 +854,7 @@ class FeedForwardNetwork(nn.Module):
         return self.network(x)
 
 
-TransformerBlockKVCache = MultiHeadKVCache
+TransformerBlockKVCache = PackedKVCache
 
 
 class TransformerBlock(nn.Module):
@@ -785,6 +874,7 @@ class TransformerBlock(nn.Module):
         num_heads: int,
         block_size: int,
         expansion_factor: int,
+        num_kv_heads: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -792,6 +882,7 @@ class TransformerBlock(nn.Module):
         self.attention = MultiHeadCausalSelfAttention(
             embedding_dim=embedding_dim,
             num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
             block_size=block_size,
         )
 
@@ -804,13 +895,13 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: Tensor,
-        past_key_values: TransformerBlockKVCache | None = None,
+        past_key_value: TransformerBlockKVCache | None = None,
         use_cache: bool = False,
     ) -> tuple[Tensor, TransformerBlockKVCache | None]:
         """Run both Residual Branches and return this Layer's optional Cache."""
         attention_output, present_key_values = self.attention(
             self.layer_norm_1(x),
-            past_key_values=past_key_values,
+            past_key_value=past_key_value,
             use_cache=use_cache,
         )
         x = x + attention_output
@@ -860,7 +951,7 @@ def verify_transformer_block() -> None:
 
     cached_output, updated_cache = transformer_block(
         sample[:, 3:, :],
-        past_key_values=prefill_cache,
+        past_key_value=prefill_cache,
         use_cache=True,
     )
     assert updated_cache is not None
@@ -896,6 +987,7 @@ class DeerlightGPTLanguageModel(nn.Module):
         num_layers: int,
         block_size: int,
         expansion_factor: int,
+        num_kv_heads: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -920,6 +1012,7 @@ class DeerlightGPTLanguageModel(nn.Module):
             TransformerBlock(
                 embedding_dim=embedding_dim,
                 num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
                 block_size=block_size,
                 expansion_factor=expansion_factor,
             )
@@ -958,9 +1051,8 @@ class DeerlightGPTLanguageModel(nn.Module):
                 )
 
             cache_lengths = {
-                keys.shape[1]
+                layer_cache[0].shape[2]
                 for layer_cache in past_key_values
-                for keys, _ in layer_cache
             }
 
             if len(cache_lengths) != 1:
@@ -992,14 +1084,14 @@ class DeerlightGPTLanguageModel(nn.Module):
         present_key_values = []
 
         for layer_index, transformer_block in enumerate(self.transformer_blocks):
-            layer_past_key_values = (
+            layer_past_key_value = (
                 None
                 if past_key_values is None
                 else past_key_values[layer_index]
             )
             x, layer_present_key_values = transformer_block(
                 x,
-                past_key_values=layer_past_key_values,
+                past_key_value=layer_past_key_value,
                 use_cache=use_cache,
             )
 
@@ -1107,9 +1199,9 @@ class DeerlightGPTLanguageModel(nn.Module):
 
             if use_kv_cache and past_key_values is not None:
                 first_layer_cache = past_key_values[0]
-                first_head_keys, _ = first_layer_cache[0]
+                first_layer_keys, _ = first_layer_cache
 
-                if first_head_keys.shape[1] >= self.block_size:
+                if first_layer_keys.shape[2] >= self.block_size:
                     # Learned absolute Position Embeddings cannot append beyond
                     # block_size. Re-prefill the shifted Window next iteration.
                     past_key_values = None
@@ -1392,6 +1484,63 @@ def save_deerlight_checkpoint(
     temporary_path.replace(checkpoint_path)
 
 
+def migrate_legacy_mha_state_dict(
+    state_dict: dict[str, Tensor],
+    num_layers: int,
+    num_heads: int,
+) -> dict[str, Tensor]:
+    """Pack legacy independent MHA Head Weights without changing the Model."""
+    legacy_marker = "transformer_blocks.0.attention.heads.0.query.weight"
+
+    if legacy_marker not in state_dict:
+        return state_dict
+
+    migrated = dict(state_dict)
+
+    for layer_index in range(num_layers):
+        attention_prefix = f"transformer_blocks.{layer_index}.attention"
+        query_weights = []
+        key_weights = []
+        value_weights = []
+        causal_mask = None
+
+        for head_index in range(num_heads):
+            head_prefix = f"{attention_prefix}.heads.{head_index}"
+            query_weights.append(
+                migrated.pop(f"{head_prefix}.query.weight")
+            )
+            key_weights.append(
+                migrated.pop(f"{head_prefix}.key.weight")
+            )
+            value_weights.append(
+                migrated.pop(f"{head_prefix}.value.weight")
+            )
+            head_mask = migrated.pop(f"{head_prefix}.causal_mask")
+
+            if causal_mask is None:
+                causal_mask = head_mask
+
+        migrated[f"{attention_prefix}.query_projection.weight"] = torch.cat(
+            query_weights,
+            dim=0,
+        )
+        migrated[f"{attention_prefix}.key_projection.weight"] = torch.cat(
+            key_weights,
+            dim=0,
+        )
+        migrated[f"{attention_prefix}.value_projection.weight"] = torch.cat(
+            value_weights,
+            dim=0,
+        )
+
+        if causal_mask is None:
+            raise RuntimeError("Legacy Attention State did not contain a Causal Mask.")
+
+        migrated[f"{attention_prefix}.causal_mask"] = causal_mask
+
+    return migrated
+
+
 def load_deerlight_checkpoint(
     checkpoint_path: Path,
     device: torch.device,
@@ -1407,18 +1556,29 @@ def load_deerlight_checkpoint(
         map_location=device,
         weights_only=True,
     )
-    model_config = checkpoint["model_config"]
+    model_config = dict(checkpoint["model_config"])
+    model_config.setdefault(
+        "num_kv_heads",
+        model_config["num_heads"],
+    )
+    checkpoint["model_config"] = model_config
 
     model = DeerlightGPTLanguageModel(
         vocab_size=model_config["vocab_size"],
         embedding_dim=model_config["embedding_dim"],
         num_heads=model_config["num_heads"],
+        num_kv_heads=model_config["num_kv_heads"],
         num_layers=model_config["num_layers"],
         block_size=model_config["block_size"],
         expansion_factor=model_config["expansion_factor"],
     ).to(device)
 
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model_state_dict = migrate_legacy_mha_state_dict(
+        state_dict=checkpoint["model_state_dict"],
+        num_layers=model_config["num_layers"],
+        num_heads=model_config["num_heads"],
+    )
+    model.load_state_dict(model_state_dict)
     model.eval()
 
     return model, checkpoint
@@ -1491,6 +1651,7 @@ def main() -> None:
         "vocab_size": len(characters),
         "embedding_dim": EMBEDDING_DIM,
         "num_heads": NUM_HEADS,
+        "num_kv_heads": NUM_KV_HEADS,
         "num_layers": NUM_LAYERS,
         "block_size": BLOCK_SIZE,
         "expansion_factor": FEED_FORWARD_EXPANSION,
@@ -1500,6 +1661,7 @@ def main() -> None:
         vocab_size=len(characters),
         embedding_dim=EMBEDDING_DIM,
         num_heads=NUM_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
         num_layers=NUM_LAYERS,
         block_size=BLOCK_SIZE,
         expansion_factor=FEED_FORWARD_EXPANSION,

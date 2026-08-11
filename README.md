@@ -18,7 +18,7 @@ The first working version will use:
 - Character-level Tokenizer
 - Token Embedding
 - Learned Position Embedding
-- Causal Multi-Head Self-Attention
+- Configurable packed MHA / GQA / MQA
 - Residual Connections
 - LayerNorm
 - GELU Feed-Forward Network
@@ -45,7 +45,7 @@ The first working version will use:
 ### Modern LLM Upgrades
 
 - [x] KV Cache
-- [ ] MQA / GQA
+- [x] MQA / GQA
 - [ ] RoPE
 - [ ] RMSNorm
 - [ ] SwiGLU
@@ -105,7 +105,7 @@ python -m pip install torch==2.12.1 --index-url https://download.pytorch.org/whl
 
 ## Current Milestone
 
-Milestone 9 complete: cached Prefill/Decode is numerically checked against Full
-Forward, and Cached/Uncached Generation has a controlled latency benchmark.
+Milestone 10 complete: packed MHA/GQA/MQA, unexpanded KV Caches, cached Decode,
+and legacy independent-Head MHA Checkpoint migration are verified.
 
-Next: implement and compare Multi-Query Attention and Grouped-Query Attention.
+Next: replace learned absolute Position Embeddings with RoPE.
