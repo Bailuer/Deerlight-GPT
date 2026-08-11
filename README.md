@@ -25,6 +25,7 @@ The first working version will use:
 - Vocabulary Projection
 - Cross-Entropy Loss
 - AdamW
+- Optional per-Layer, per-Head KV Cache for Autoregressive Generation
 
 ## Roadmap
 
@@ -38,16 +39,16 @@ The first working version will use:
 - [x] Multi-Head Self-Attention
 - [x] Transformer Block
 - [x] Decoder-only GPT
-- [ ] Training Loop
-- [ ] Autoregressive Generation
+- [x] Training Loop
+- [x] Autoregressive Generation
 
 ### Modern LLM Upgrades
 
-- [ ] KV Cache
+- [x] KV Cache
+- [ ] MQA / GQA
 - [ ] RoPE
 - [ ] RMSNorm
 - [ ] SwiGLU
-- [ ] MQA / GQA
 - [ ] PyTorch SDPA / Flash Attention
 - [ ] Mixture of Experts
 - [ ] Scaling Law Experiments
@@ -104,4 +105,7 @@ python -m pip install torch==2.12.1 --index-url https://download.pytorch.org/whl
 
 ## Current Milestone
 
-Milestone 7 in progress: train Deerlight GPT end to end, evaluate Validation Loss, and compare generation with the Bigram Baseline.
+Milestone 9 complete: cached Prefill/Decode is numerically checked against Full
+Forward, and Cached/Uncached Generation has a controlled latency benchmark.
+
+Next: implement and compare Multi-Query Attention and Grouped-Query Attention.

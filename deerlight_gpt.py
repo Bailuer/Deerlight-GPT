@@ -33,12 +33,15 @@ GPT_LEARNING_RATE = 3e-4
 GPT_TRAINING_STEPS = 3000
 GPT_EVAL_INTERVAL = 300
 GPT_EVAL_BATCHES = 20
+GENERATION_TEMPERATURE = 0.8
+GENERATION_TOP_K = 20
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DATA_PATH = PROJECT_DIR / "data" / "input.txt"
+CHECKPOINT_PATH = PROJECT_DIR / "checkpoints" / "deerlight_gpt_best.pt"
 
 
 # -----------------------------------------------------------------------------
@@ -352,6 +355,9 @@ def train_bigram_model(
 # Milestone 3: Single-Head Causal Self-Attention
 # -----------------------------------------------------------------------------
 
+HeadKVCache = tuple[Tensor, Tensor]
+
+
 class CausalSelfAttentionHead(nn.Module):
     """Let every Token read information from itself and earlier Tokens.
 
@@ -401,53 +407,92 @@ class CausalSelfAttentionHead(nn.Module):
             ),
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Return context-aware Token Vectors."""
-        batch_size, time, embedding_dim = x.shape
+    def forward(
+        self,
+        x: Tensor,
+        past_key_value: HeadKVCache | None = None,
+        use_cache: bool = False,
+    ) -> tuple[Tensor, HeadKVCache | None]:
+        """Return context-aware Token Vectors and an optional updated KV Cache."""
+        batch_size, query_time, _ = x.shape
 
-        if time > self.causal_mask.shape[0]:
+        # Module 1: Project every Token Vector into Query, Key, and Value.
+        # Shape of each new Tensor: (batch_size, query_time, head_size)
+        queries = self.query(x)
+        new_keys = self.key(x)
+        new_values = self.value(x)
+
+        # Module 2: Reuse historical Keys and Values during cached Decoding.
+        past_length = 0
+
+        if past_key_value is not None:
+            past_keys, past_values = past_key_value
+
+            if past_keys.shape != past_values.shape:
+                raise ValueError("Cached Keys and Values must have the same Shape.")
+
+            if past_keys.ndim != 3:
+                raise ValueError(
+                    "Cached Keys and Values must have Shape "
+                    "(batch_size, past_time, head_size)."
+                )
+
+            if past_keys.shape[0] != batch_size:
+                raise ValueError("KV Cache Batch Size must match the Input Batch Size.")
+
+            if past_keys.shape[2] != self.head_size:
+                raise ValueError("KV Cache Head Size must match the Attention Head Size.")
+
+            past_length = past_keys.shape[1]
+            keys = torch.cat((past_keys, new_keys), dim=1)
+            values = torch.cat((past_values, new_values), dim=1)
+        else:
+            keys = new_keys
+            values = new_values
+
+        key_time = keys.shape[1]
+
+        if key_time > self.causal_mask.shape[0]:
             raise ValueError(
-                f"Sequence Length {time} exceeds Block Size "
+                f"Cached Sequence Length {key_time} exceeds Block Size "
                 f"{self.causal_mask.shape[0]}."
             )
 
-        # Module 1: Project every Token Vector into Query, Key, and Value.
-        # Shape of each: (batch_size, time, head_size)
-        queries = self.query(x)
-        keys = self.key(x)
-        values = self.value(x)
-
-        # Module 2: Compare every Query with every Key.
-        # Shape: (batch_size, time, time)
+        # Module 3: Compare new Queries with both historical and new Keys.
+        # Shape: (batch_size, query_time, key_time)
         attention_scores = queries @ keys.transpose(-2, -1)
         attention_scores = attention_scores * (self.head_size ** -0.5)
 
-        # Module 3: Hide future Positions from every Query.
-        active_mask = self.causal_mask[:time, :time]
+        # Module 4: Select the Mask rows belonging to the new Query Positions.
+        active_mask = self.causal_mask[
+            past_length:past_length + query_time,
+            :key_time,
+        ]
         attention_scores = attention_scores.masked_fill(
             ~active_mask,
             float("-inf"),
         )
 
-        # Module 4: Convert Scores into a Probability Distribution.
+        # Module 5: Convert Scores into a Probability Distribution.
         # Every row should sum to 1.
         attention_weights = F.softmax(
             attention_scores,
             dim=-1,
         )
 
-        # Module 5: Compute a weighted mixture of the Value Vectors.
-        # Shape: (batch_size, time, head_size)
+        # Module 6: Compute a weighted mixture of all available Value Vectors.
+        # Shape: (batch_size, query_time, head_size)
         output = attention_weights @ values
 
-        expected_shape = (batch_size, time, self.head_size)
+        expected_shape = (batch_size, query_time, self.head_size)
         if output.shape != expected_shape:
             raise RuntimeError(
                 f"Attention Output Shape {tuple(output.shape)} does not match "
                 f"the expected Shape {expected_shape}."
             )
 
-        return output
+        present_key_value = (keys, values) if use_cache else None
+        return output, present_key_value
 
 
 def verify_single_head_attention() -> None:
@@ -464,13 +509,13 @@ def verify_single_head_attention() -> None:
         EMBEDDING_DIM,
     )
 
-    original_output = attention_head(sample)
+    original_output, _ = attention_head(sample)
 
     changed_sample = sample.clone()
     changed_sample[:, 2:, :] = torch.randn_like(
         changed_sample[:, 2:, :]
     )
-    changed_output = attention_head(changed_sample)
+    changed_output, _ = attention_head(changed_sample)
 
     assert original_output.shape == (2, 4, HEAD_SIZE)
     assert torch.isfinite(original_output).all()
@@ -480,10 +525,36 @@ def verify_single_head_attention() -> None:
         atol=1e-6,
     )
 
+    # A cached one-Token Decode must match the final Position of a Full Forward.
+    _, prefill_cache = attention_head(
+        sample[:, :3, :],
+        use_cache=True,
+    )
+    assert prefill_cache is not None
+    assert prefill_cache[0].shape == (2, 3, HEAD_SIZE)
+    assert prefill_cache[1].shape == (2, 3, HEAD_SIZE)
+
+    cached_output, updated_cache = attention_head(
+        sample[:, 3:, :],
+        past_key_value=prefill_cache,
+        use_cache=True,
+    )
+    assert updated_cache is not None
+    assert updated_cache[0].shape == (2, 4, HEAD_SIZE)
+    assert updated_cache[1].shape == (2, 4, HEAD_SIZE)
+    assert torch.allclose(
+        cached_output,
+        original_output[:, 3:, :],
+        atol=1e-6,
+    )
+
 
 # -----------------------------------------------------------------------------
 # Milestone 4: Multi-Head Causal Self-Attention
 # -----------------------------------------------------------------------------
+
+MultiHeadKVCache = tuple[HeadKVCache, ...]
+
 
 class MultiHeadCausalSelfAttention(nn.Module):
     """Run multiple Causal Attention Heads and combine their Outputs.
@@ -531,15 +602,46 @@ class MultiHeadCausalSelfAttention(nn.Module):
             out_features=embedding_dim,
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Return the combined Output of all Attention Heads."""
+    def forward(
+        self,
+        x: Tensor,
+        past_key_values: MultiHeadKVCache | None = None,
+        use_cache: bool = False,
+    ) -> tuple[Tensor, MultiHeadKVCache | None]:
+        """Return the combined Head Output and optional per-Head KV Caches."""
         batch_size, time, _ = x.shape
 
+        if (
+            past_key_values is not None
+            and len(past_key_values) != self.num_heads
+        ):
+            raise ValueError(
+                "Multi-Head KV Cache must contain one Cache per Attention Head."
+            )
+
         # Module 3: Give the same Input to every Attention Head.
-        head_outputs = [
-            head(x)
-            for head in self.heads
-        ]
+        head_outputs = []
+        present_key_values = []
+
+        for head_index, head in enumerate(self.heads):
+            past_key_value = (
+                None
+                if past_key_values is None
+                else past_key_values[head_index]
+            )
+            head_output, present_key_value = head(
+                x,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+            )
+            head_outputs.append(head_output)
+
+            if use_cache:
+                if present_key_value is None:
+                    raise RuntimeError(
+                        "Attention Head did not return a requested KV Cache."
+                    )
+                present_key_values.append(present_key_value)
 
         # Module 4: Join all Head Features along the final Dimension.
         concatenated = torch.cat(
@@ -557,7 +659,8 @@ class MultiHeadCausalSelfAttention(nn.Module):
                 f"the expected Shape {expected_shape}."
             )
 
-        return output
+        present = tuple(present_key_values) if use_cache else None
+        return output, present
 
 
 def verify_multi_head_attention() -> None:
@@ -574,13 +677,13 @@ def verify_multi_head_attention() -> None:
         EMBEDDING_DIM,
     )
 
-    original_output = attention(sample)
+    original_output, _ = attention(sample)
 
     changed_sample = sample.clone()
     changed_sample[:, 2:, :] = torch.randn_like(
         changed_sample[:, 2:, :]
     )
-    changed_output = attention(changed_sample)
+    changed_output, _ = attention(changed_sample)
 
     assert len(attention.heads) == NUM_HEADS
     assert attention.head_size == EMBEDDING_DIM // NUM_HEADS
@@ -589,6 +692,35 @@ def verify_multi_head_attention() -> None:
     assert torch.allclose(
         original_output[:, :2, :],
         changed_output[:, :2, :],
+        atol=1e-6,
+    )
+
+    # Every Head owns an independent Cache during cached Decoding.
+    _, prefill_cache = attention(
+        sample[:, :3, :],
+        use_cache=True,
+    )
+    assert prefill_cache is not None
+    assert len(prefill_cache) == NUM_HEADS
+
+    for keys, values in prefill_cache:
+        assert keys.shape == (2, 3, attention.head_size)
+        assert values.shape == (2, 3, attention.head_size)
+
+    cached_output, updated_cache = attention(
+        sample[:, 3:, :],
+        past_key_values=prefill_cache,
+        use_cache=True,
+    )
+    assert updated_cache is not None
+
+    for keys, values in updated_cache:
+        assert keys.shape == (2, 4, attention.head_size)
+        assert values.shape == (2, 4, attention.head_size)
+
+    assert torch.allclose(
+        cached_output,
+        original_output[:, 3:, :],
         atol=1e-6,
     )
 
@@ -633,6 +765,9 @@ class FeedForwardNetwork(nn.Module):
         return self.network(x)
 
 
+TransformerBlockKVCache = MultiHeadKVCache
+
+
 class TransformerBlock(nn.Module):
     """Combine Token communication and per-Token nonlinear processing.
 
@@ -666,16 +801,24 @@ class TransformerBlock(nn.Module):
             expansion_factor=expansion_factor,
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Run the Attention and Feed-Forward Residual Branches."""
-        x = x + self.attention(
-            self.layer_norm_1(x)
+    def forward(
+        self,
+        x: Tensor,
+        past_key_values: TransformerBlockKVCache | None = None,
+        use_cache: bool = False,
+    ) -> tuple[Tensor, TransformerBlockKVCache | None]:
+        """Run both Residual Branches and return this Layer's optional Cache."""
+        attention_output, present_key_values = self.attention(
+            self.layer_norm_1(x),
+            past_key_values=past_key_values,
+            use_cache=use_cache,
         )
+        x = x + attention_output
         x = x + self.feed_forward(
             self.layer_norm_2(x)
         )
 
-        return x
+        return x, present_key_values
 
 
 def verify_transformer_block() -> None:
@@ -693,19 +836,37 @@ def verify_transformer_block() -> None:
         EMBEDDING_DIM,
     )
 
-    original_output = transformer_block(sample)
+    original_output, _ = transformer_block(sample)
 
     changed_sample = sample.clone()
     changed_sample[:, 2:, :] = torch.randn_like(
         changed_sample[:, 2:, :]
     )
-    changed_output = transformer_block(changed_sample)
+    changed_output, _ = transformer_block(changed_sample)
 
     assert original_output.shape == sample.shape
     assert torch.isfinite(original_output).all()
     assert torch.allclose(
         original_output[:, :2, :],
         changed_output[:, :2, :],
+        atol=1e-6,
+    )
+
+    _, prefill_cache = transformer_block(
+        sample[:, :3, :],
+        use_cache=True,
+    )
+    assert prefill_cache is not None
+
+    cached_output, updated_cache = transformer_block(
+        sample[:, 3:, :],
+        past_key_values=prefill_cache,
+        use_cache=True,
+    )
+    assert updated_cache is not None
+    assert torch.allclose(
+        cached_output,
+        original_output[:, 3:, :],
         atol=1e-6,
     )
 
@@ -720,6 +881,9 @@ def verify_transformer_block() -> None:
 # -----------------------------------------------------------------------------
 # Milestone 6: Decoder-only Deerlight GPT
 # -----------------------------------------------------------------------------
+
+ModelKVCache = tuple[TransformerBlockKVCache, ...]
+
 
 class DeerlightGPTLanguageModel(nn.Module):
     """Predict the next Token with a stack of Causal Transformer Blocks."""
@@ -775,25 +939,49 @@ class DeerlightGPTLanguageModel(nn.Module):
         self,
         token_ids: Tensor,
         targets: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor | None]:
-        """Return next-Token Logits and optional Cross-Entropy Loss."""
+        past_key_values: ModelKVCache | None = None,
+        use_cache: bool = False,
+    ) -> tuple[Tensor, Tensor | None, ModelKVCache | None]:
+        """Return Logits, optional Loss, and optional per-Layer KV Caches."""
         if token_ids.ndim != 2:
             raise ValueError(
                 "Token IDs must have Shape (batch_size, time)."
             )
 
         batch_size, time = token_ids.shape
+        past_length = 0
 
-        if time > self.block_size:
+        if past_key_values is not None:
+            if len(past_key_values) != len(self.transformer_blocks):
+                raise ValueError(
+                    "Model KV Cache must contain one Cache per Transformer Layer."
+                )
+
+            cache_lengths = {
+                keys.shape[1]
+                for layer_cache in past_key_values
+                for keys, _ in layer_cache
+            }
+
+            if len(cache_lengths) != 1:
+                raise ValueError(
+                    "Every Layer and Head KV Cache must have the same Time Length."
+                )
+
+            past_length = cache_lengths.pop()
+
+        if past_length + time > self.block_size:
             raise ValueError(
-                f"Sequence Length {time} exceeds Block Size {self.block_size}."
+                f"Cached Sequence Length {past_length + time} exceeds "
+                f"Block Size {self.block_size}."
             )
 
         # Module 1: Build position-aware Token Representations.
         token_embeddings = self.token_embedding_table(token_ids)
 
         position_ids = torch.arange(
-            time,
+            past_length,
+            past_length + time,
             device=token_ids.device,
         )
         position_embeddings = self.position_embedding_table(position_ids)
@@ -801,8 +989,26 @@ class DeerlightGPTLanguageModel(nn.Module):
         x = token_embeddings + position_embeddings
 
         # Module 2: Let all Transformer Blocks process the Sequence.
-        for transformer_block in self.transformer_blocks:
-            x = transformer_block(x)
+        present_key_values = []
+
+        for layer_index, transformer_block in enumerate(self.transformer_blocks):
+            layer_past_key_values = (
+                None
+                if past_key_values is None
+                else past_key_values[layer_index]
+            )
+            x, layer_present_key_values = transformer_block(
+                x,
+                past_key_values=layer_past_key_values,
+                use_cache=use_cache,
+            )
+
+            if use_cache:
+                if layer_present_key_values is None:
+                    raise RuntimeError(
+                        "Transformer Block did not return a requested KV Cache."
+                    )
+                present_key_values.append(layer_present_key_values)
 
         # Module 3: Produce one Vocabulary Score per Token and Position.
         x = self.final_layer_norm(x)
@@ -836,21 +1042,55 @@ class DeerlightGPTLanguageModel(nn.Module):
                 flat_targets,
             )
 
-        return logits, loss
+        present = tuple(present_key_values) if use_cache else None
+        return logits, loss, present
 
     @torch.no_grad()
     def generate(
         self,
         token_ids: Tensor,
         max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        use_kv_cache: bool = True,
     ) -> Tensor:
-        """Autoregressively sample Tokens using at most block_size Context."""
-        for _ in range(max_new_tokens):
-            # Learned Position Embeddings only support block_size Positions.
-            context = token_ids[:, -self.block_size:]
+        """Autoregressively sample Tokens with an optional per-Layer KV Cache."""
+        if temperature <= 0:
+            raise ValueError("Sampling Temperature must be positive.")
 
-            logits, _ = self(context)
-            final_logits = logits[:, -1, :]
+        if top_k is not None and top_k <= 0:
+            raise ValueError("Top-k must be positive when provided.")
+
+        past_key_values = None
+
+        for _ in range(max_new_tokens):
+            if use_kv_cache and past_key_values is not None:
+                # Decode only the newest Token; historical K/V come from Cache.
+                model_input = token_ids[:, -1:]
+            else:
+                # Prefill the Prompt or rebuild a full sliding Context Window.
+                model_input = token_ids[:, -self.block_size:]
+
+            logits, _, past_key_values = self(
+                model_input,
+                past_key_values=past_key_values,
+                use_cache=use_kv_cache,
+            )
+            final_logits = logits[:, -1, :] / temperature
+
+            if top_k is not None:
+                active_k = min(top_k, final_logits.shape[-1])
+                top_values = torch.topk(
+                    final_logits,
+                    k=active_k,
+                    dim=-1,
+                ).values
+                cutoff = top_values[:, -1].unsqueeze(-1)
+                final_logits = final_logits.masked_fill(
+                    final_logits < cutoff,
+                    float("-inf"),
+                )
+
             probabilities = F.softmax(
                 final_logits,
                 dim=-1,
@@ -864,6 +1104,15 @@ class DeerlightGPTLanguageModel(nn.Module):
                 (token_ids, next_token_id),
                 dim=1,
             )
+
+            if use_kv_cache and past_key_values is not None:
+                first_layer_cache = past_key_values[0]
+                first_head_keys, _ = first_layer_cache[0]
+
+                if first_head_keys.shape[1] >= self.block_size:
+                    # Learned absolute Position Embeddings cannot append beyond
+                    # block_size. Re-prefill the shifted Window next iteration.
+                    past_key_values = None
 
         return token_ids
 
@@ -892,13 +1141,49 @@ def verify_deerlight_gpt() -> None:
         size=(2, 8),
     )
 
-    logits, loss = model(token_ids, targets)
+    logits, loss, _ = model(token_ids, targets)
 
     assert logits.shape == (2, 8, vocab_size)
     assert torch.isfinite(logits).all()
     assert loss is not None
     assert loss.ndim == 0
     assert torch.isfinite(loss)
+
+    # Cached Model Decode must match the final Position of a Full Forward.
+    _, _, prefill_cache = model(
+        token_ids[:, :7],
+        use_cache=True,
+    )
+    assert prefill_cache is not None
+    assert len(prefill_cache) == NUM_LAYERS
+
+    cached_logits, _, updated_cache = model(
+        token_ids[:, 7:],
+        past_key_values=prefill_cache,
+        use_cache=True,
+    )
+    assert updated_cache is not None
+    assert torch.allclose(
+        cached_logits,
+        logits[:, 7:],
+        atol=1e-5,
+    )
+
+    # Cached and uncached greedy Generation must produce identical Tokens.
+    generation_context = token_ids[:, :4]
+    uncached_generated = model.generate(
+        token_ids=generation_context.clone(),
+        max_new_tokens=4,
+        top_k=1,
+        use_kv_cache=False,
+    )
+    cached_generated = model.generate(
+        token_ids=generation_context.clone(),
+        max_new_tokens=4,
+        top_k=1,
+        use_kv_cache=True,
+    )
+    assert torch.equal(cached_generated, uncached_generated)
 
     loss.backward()
 
@@ -956,7 +1241,7 @@ def estimate_deerlight_gpt_losses(
             x_batch = x_batch.to(model_device)
             y_batch = y_batch.to(model_device)
 
-            _, loss = model(x_batch, y_batch)
+            _, loss, _ = model(x_batch, y_batch)
 
             if loss is None:
                 raise RuntimeError(
@@ -981,6 +1266,9 @@ def train_deerlight_gpt(
     evaluation_batches: int,
     batch_size: int,
     block_size: int,
+    checkpoint_path: Path | None = None,
+    model_config: dict[str, int] | None = None,
+    characters: list[str] | None = None,
 ) -> None:
     """Train every Deerlight GPT Parameter end to end with AdamW."""
     if training_steps <= 0:
@@ -996,6 +1284,13 @@ def train_deerlight_gpt(
 
     model.train()
     model_device = next(model.parameters()).device
+    best_validation_loss = float("inf")
+
+    if checkpoint_path is not None:
+        if model_config is None or characters is None:
+            raise ValueError(
+                "Model Configuration and Characters are required for Checkpointing."
+            )
 
     for step in range(1, training_steps + 1):
         x_batch, y_batch = get_batch(
@@ -1008,7 +1303,7 @@ def train_deerlight_gpt(
         x_batch = x_batch.to(model_device)
         y_batch = y_batch.to(model_device)
 
-        _, training_loss = model(x_batch, y_batch)
+        _, training_loss, _ = model(x_batch, y_batch)
 
         if training_loss is None:
             raise RuntimeError(
@@ -1040,6 +1335,93 @@ def train_deerlight_gpt(
                 f"Training Loss: {losses['train']:.4f} | "
                 f"Validation Loss: {losses['validation']:.4f}"
             )
+
+            if losses["validation"] < best_validation_loss:
+                best_validation_loss = losses["validation"]
+
+                if checkpoint_path is not None:
+                    save_deerlight_checkpoint(
+                        checkpoint_path=checkpoint_path,
+                        model=model,
+                        optimizer=optimizer,
+                        step=step,
+                        training_loss=losses["train"],
+                        validation_loss=losses["validation"],
+                        model_config=model_config,
+                        characters=characters,
+                    )
+                    print(
+                        f"Saved Best Checkpoint: {checkpoint_path.name}"
+                    )
+
+
+# -----------------------------------------------------------------------------
+# Milestone 8: Checkpointing and Sampling Controls
+# -----------------------------------------------------------------------------
+
+def save_deerlight_checkpoint(
+    checkpoint_path: Path,
+    model: DeerlightGPTLanguageModel,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    training_loss: float,
+    validation_loss: float,
+    model_config: dict[str, int],
+    characters: list[str],
+) -> None:
+    """Atomically save Model, Optimizer, Metrics, Config, and Vocabulary."""
+    checkpoint_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "step": step,
+        "training_loss": training_loss,
+        "validation_loss": validation_loss,
+        "model_config": model_config,
+        "characters": characters,
+    }
+
+    temporary_path = checkpoint_path.with_suffix(
+        checkpoint_path.suffix + ".tmp"
+    )
+    torch.save(checkpoint, temporary_path)
+    temporary_path.replace(checkpoint_path)
+
+
+def load_deerlight_checkpoint(
+    checkpoint_path: Path,
+    device: torch.device,
+) -> tuple[DeerlightGPTLanguageModel, dict]:
+    """Rebuild a Deerlight GPT and restore its best saved Parameters."""
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {checkpoint_path}"
+        )
+
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=True,
+    )
+    model_config = checkpoint["model_config"]
+
+    model = DeerlightGPTLanguageModel(
+        vocab_size=model_config["vocab_size"],
+        embedding_dim=model_config["embedding_dim"],
+        num_heads=model_config["num_heads"],
+        num_layers=model_config["num_layers"],
+        block_size=model_config["block_size"],
+        expansion_factor=model_config["expansion_factor"],
+    ).to(device)
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    return model, checkpoint
 
 
 # -----------------------------------------------------------------------------
@@ -1105,6 +1487,15 @@ def main() -> None:
     # Reset the Random Seed so verification does not affect Training.
     torch.manual_seed(SEED)
 
+    model_config = {
+        "vocab_size": len(characters),
+        "embedding_dim": EMBEDDING_DIM,
+        "num_heads": NUM_HEADS,
+        "num_layers": NUM_LAYERS,
+        "block_size": BLOCK_SIZE,
+        "expansion_factor": FEED_FORWARD_EXPANSION,
+    }
+
     model = DeerlightGPTLanguageModel(
         vocab_size=len(characters),
         embedding_dim=EMBEDDING_DIM,
@@ -1136,19 +1527,38 @@ def main() -> None:
         evaluation_batches=GPT_EVAL_BATCHES,
         batch_size=BATCH_SIZE,
         block_size=BLOCK_SIZE,
+        checkpoint_path=CHECKPOINT_PATH,
+        model_config=model_config,
+        characters=characters,
     )
 
-    initial_context = torch.zeros(
-        (1, 1),
+    model, checkpoint = load_deerlight_checkpoint(
+        checkpoint_path=CHECKPOINT_PATH,
+        device=DEVICE,
+    )
+    print(
+        f"\nLoaded Best Checkpoint from Step {checkpoint['step']} "
+        f"with Validation Loss {checkpoint['validation_loss']:.4f}"
+    )
+
+    initial_token_id = stoi.get("\n", 0)
+    initial_context = torch.tensor(
+        [[initial_token_id]],
         dtype=torch.long,
         device=DEVICE,
     )
     generated_token_ids = model.generate(
         token_ids=initial_context,
         max_new_tokens=GENERATION_LENGTH,
+        temperature=GENERATION_TEMPERATURE,
+        top_k=GENERATION_TOP_K,
     )
 
-    print("\nGenerated Text:")
+    print(
+        f"\nGenerated Text "
+        f"(Temperature={GENERATION_TEMPERATURE}, "
+        f"Top-k={GENERATION_TOP_K}):"
+    )
     print(
         decode(
             generated_token_ids[0].detach().cpu().tolist(),

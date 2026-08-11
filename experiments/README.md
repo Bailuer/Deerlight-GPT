@@ -13,3 +13,5 @@ Each experiment should record:
 ## Recorded Experiments
 
 - [Model Width: C=32 vs C=64](model-width-c32-vs-c64.md)
+- [Sampling Temperature with Fixed Top-k](sampling-temperature.md)
+- [KV Cache Latency](kv-cache-latency.md)
