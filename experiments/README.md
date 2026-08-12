@@ -19,3 +19,4 @@ Each experiment should record:
 - [RoPE Architecture Verification](rope-verification.md)
 - [RMSNorm Architecture Verification](rmsnorm-verification.md)
 - [SwiGLU Architecture Verification](swiglu-verification.md)
+- [Medium Capability Baseline](medium-capability-baseline.md)

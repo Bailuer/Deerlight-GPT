@@ -58,6 +58,7 @@ The first working version will use:
 ```text
 Deerlight-GPT/
 |-- deerlight_gpt.py      # First transparent single-file implementation
+|-- train_medium.py       # Reproducible CUDA Pilot and Medium training entry point
 |-- data/                 # Local training text (not committed by default)
 |-- notes/                # Concepts rewritten in the author's own words
 |-- experiments/          # Controlled experiments and results
@@ -93,6 +94,23 @@ The Dataset itself is ignored by Git by default. Record its source and license i
 python deerlight_gpt.py
 ```
 
+Run a 30-Step resource and stability Pilot before committing to a full
+Medium experiment:
+
+```powershell
+python train_medium.py --mode pilot
+```
+
+Then train the 9.49M-Parameter Medium capability baseline:
+
+```powershell
+python train_medium.py --mode train
+```
+
+The Medium script uses BF16 Autocast and fused AdamW on CUDA, clips the
+Gradient Norm, applies Early Stopping, and generates from the Best Validation
+Checkpoint rather than the final training state.
+
 The training script automatically uses CUDA when a CUDA-enabled PyTorch build
 is available, and otherwise falls back to CPU.
 
@@ -105,8 +123,11 @@ python -m pip install torch==2.12.1 --index-url https://download.pytorch.org/whl
 
 ## Current Milestone
 
-Milestone 13 complete: a bias-free, hardware-aligned SwiGLU Feed-Forward
-Network replaces the GELU MLP and passes end-to-end Gradient and Cache checks.
+Milestone 14 complete: the 9.49M-Parameter Medium GQA model has a reproducible
+CUDA training entry point and a recorded capability baseline. Its Best
+Validation Loss was `1.5610` at Step 1000; continuing to Step 5000 caused clear
+Overfitting despite falling Training Loss.
 
-Next: configure and train Deerlight GPT Medium as the modern Architecture
-capability baseline.
+Next: replace the transparent Attention kernel with PyTorch SDPA and measure
+whether the Flash Attention backend improves speed and memory without changing
+model outputs.
