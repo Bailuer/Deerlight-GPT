@@ -39,7 +39,9 @@ def measure_configuration(
         num_kv_heads=num_kv_heads,
         num_layers=deerlight.NUM_LAYERS,
         block_size=deerlight.BLOCK_SIZE,
-        expansion_factor=deerlight.FEED_FORWARD_EXPANSION,
+        feed_forward_dim=deerlight.calculate_swiglu_hidden_dim(
+            deerlight.EMBEDDING_DIM,
+        ),
     ).to(deerlight.DEVICE)
     model.eval()
 

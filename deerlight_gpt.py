@@ -28,7 +28,9 @@ EMBEDDING_DIM = 64
 HEAD_SIZE = 16
 NUM_HEADS = 4
 NUM_KV_HEADS = NUM_HEADS
-FEED_FORWARD_EXPANSION = 4
+ROPE_BASE = 10_000.0
+RMS_NORM_EPSILON = 1e-5
+FEED_FORWARD_MULTIPLE_OF = 16
 NUM_LAYERS = 2
 GPT_LEARNING_RATE = 3e-4
 GPT_TRAINING_STEPS = 3000
@@ -42,7 +44,11 @@ DEVICE = torch.device(
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DATA_PATH = PROJECT_DIR / "data" / "input.txt"
-CHECKPOINT_PATH = PROJECT_DIR / "checkpoints" / "deerlight_gpt_best.pt"
+CHECKPOINT_PATH = (
+    PROJECT_DIR
+    / "checkpoints"
+    / "deerlight_gpt_rope_rms_swiglu_best.pt"
+)
 
 
 # -----------------------------------------------------------------------------
@@ -557,6 +563,105 @@ def verify_single_head_attention() -> None:
 PackedKVCache = tuple[Tensor, Tensor]
 
 
+class RotaryPositionEmbedding(nn.Module):
+    """Rotate pairs of Head Features using fixed multi-scale Frequencies."""
+
+    def __init__(
+        self,
+        head_size: int,
+        base: float = ROPE_BASE,
+    ) -> None:
+        super().__init__()
+
+        if head_size % 2 != 0:
+            raise ValueError("RoPE Head Size must be even.")
+
+        if base <= 0:
+            raise ValueError("RoPE Base must be positive.")
+
+        inverse_frequencies = base ** (
+            -torch.arange(
+                0,
+                head_size,
+                2,
+                dtype=torch.float32,
+            ) / head_size
+        )
+        self.register_buffer(
+            "inverse_frequencies",
+            inverse_frequencies,
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        position_ids: Tensor,
+    ) -> Tensor:
+        """Apply one 2D Rotation per adjacent Feature Pair."""
+        if x.shape[-1] != self.inverse_frequencies.numel() * 2:
+            raise ValueError("RoPE Input Head Size does not match its Frequencies.")
+
+        if position_ids.ndim != 1 or position_ids.shape[0] != x.shape[-2]:
+            raise ValueError(
+                "Position IDs must have Shape (time,) matching the Input Time."
+            )
+
+        angles = torch.outer(
+            position_ids.to(dtype=torch.float32),
+            self.inverse_frequencies,
+        )
+        cosine = angles.cos().to(dtype=x.dtype)[None, None, :, :]
+        sine = angles.sin().to(dtype=x.dtype)[None, None, :, :]
+
+        even_features = x[..., 0::2]
+        odd_features = x[..., 1::2]
+        rotated_even = even_features * cosine - odd_features * sine
+        rotated_odd = even_features * sine + odd_features * cosine
+
+        return torch.stack(
+            (rotated_even, rotated_odd),
+            dim=-1,
+        ).flatten(start_dim=-2)
+
+
+def verify_rotary_position_embedding() -> None:
+    """Check RoPE Shape, Norm preservation, and relative-shift invariance."""
+    rotary_embedding = RotaryPositionEmbedding(
+        head_size=HEAD_SIZE,
+        base=ROPE_BASE,
+    )
+    queries = torch.randn(2, NUM_HEADS, 4, HEAD_SIZE)
+    keys = torch.randn(2, NUM_HEADS, 4, HEAD_SIZE)
+    position_ids = torch.arange(4)
+    shifted_position_ids = position_ids + 11
+
+    rotated_queries = rotary_embedding(queries, position_ids)
+    rotated_keys = rotary_embedding(keys, position_ids)
+    shifted_queries = rotary_embedding(queries, shifted_position_ids)
+    shifted_keys = rotary_embedding(keys, shifted_position_ids)
+
+    assert rotated_queries.shape == queries.shape
+    assert rotated_keys.shape == keys.shape
+    assert torch.allclose(
+        rotated_queries.norm(dim=-1),
+        queries.norm(dim=-1),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        rotated_keys.norm(dim=-1),
+        keys.norm(dim=-1),
+        atol=1e-6,
+    )
+
+    attention_scores = rotated_queries @ rotated_keys.transpose(-2, -1)
+    shifted_scores = shifted_queries @ shifted_keys.transpose(-2, -1)
+    assert torch.allclose(
+        shifted_scores,
+        attention_scores,
+        atol=1e-5,
+    )
+
+
 class MultiHeadCausalSelfAttention(nn.Module):
     """Run packed MHA, GQA, or MQA with an unexpanded KV Cache.
 
@@ -573,6 +678,7 @@ class MultiHeadCausalSelfAttention(nn.Module):
         num_heads: int,
         block_size: int,
         num_kv_heads: int | None = None,
+        rope_base: float = ROPE_BASE,
     ) -> None:
         super().__init__()
 
@@ -600,6 +706,10 @@ class MultiHeadCausalSelfAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_size = embedding_dim // num_heads
         self.queries_per_kv_head = num_heads // num_kv_heads
+        self.rotary_embedding = RotaryPositionEmbedding(
+            head_size=self.head_size,
+            base=rope_base,
+        )
 
         # Module 1: Project all Query Heads and the smaller set of KV Heads.
         self.query_projection = nn.Linear(
@@ -644,7 +754,8 @@ class MultiHeadCausalSelfAttention(nn.Module):
         """Return combined Query-Head Outputs and an optional packed KV Cache."""
         batch_size, query_time, _ = x.shape
 
-        # Shapes: Q=(B, num_heads, Tq, H), K/V=(B, num_kv_heads, Tq, H)
+        # Shapes before RoPE: Q=(B, num_heads, Tq, H),
+        # K/V=(B, num_kv_heads, Tq, H)
         queries = self.query_projection(x).view(
             batch_size,
             query_time,
@@ -688,6 +799,20 @@ class MultiHeadCausalSelfAttention(nn.Module):
                 )
 
             past_length = past_keys.shape[2]
+        else:
+            past_keys = None
+            past_values = None
+
+        # RoPE rotates only the new Q/K using their absolute Position IDs.
+        position_ids = torch.arange(
+            past_length,
+            past_length + query_time,
+            device=x.device,
+        )
+        queries = self.rotary_embedding(queries, position_ids)
+        new_keys = self.rotary_embedding(new_keys, position_ids)
+
+        if past_keys is not None and past_values is not None:
             keys = torch.cat((past_keys, new_keys), dim=2)
             values = torch.cat((past_values, new_values), dim=2)
         else:
@@ -818,8 +943,99 @@ def verify_multi_head_attention() -> None:
 # Milestone 5: Transformer Block
 # -----------------------------------------------------------------------------
 
+class RMSNorm(nn.Module):
+    """Normalize each Token by its Root Mean Square without mean-centering."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        eps: float = RMS_NORM_EPSILON,
+    ) -> None:
+        super().__init__()
+
+        if embedding_dim <= 0:
+            raise ValueError("RMSNorm Embedding Dimension must be positive.")
+
+        if eps <= 0:
+            raise ValueError("RMSNorm Epsilon must be positive.")
+
+        self.eps = eps
+        self.weight = nn.Parameter(
+            torch.ones(embedding_dim)
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Scale the final Dimension to approximately unit RMS."""
+        mean_square = x.pow(2).mean(
+            dim=-1,
+            keepdim=True,
+        )
+        inverse_rms = torch.rsqrt(
+            mean_square + self.eps
+        )
+        normalized = x * inverse_rms
+        return normalized * self.weight
+
+
+def verify_rms_norm() -> None:
+    """Check Shape, unit RMS, scale invariance, Parameters, and Gradients."""
+    rms_norm = RMSNorm(
+        embedding_dim=EMBEDDING_DIM,
+        eps=RMS_NORM_EPSILON,
+    )
+    sample = torch.randn(
+        2,
+        4,
+        EMBEDDING_DIM,
+        requires_grad=True,
+    )
+    output = rms_norm(sample)
+    scaled_output = rms_norm(sample * 10.0)
+
+    assert output.shape == sample.shape
+    assert sum(
+        parameter.numel()
+        for parameter in rms_norm.parameters()
+    ) == EMBEDDING_DIM
+    assert torch.allclose(
+        output.pow(2).mean(dim=-1),
+        torch.ones(2, 4),
+        atol=1e-4,
+    )
+    assert torch.allclose(
+        scaled_output,
+        output,
+        atol=1e-4,
+    )
+
+    test_loss = output.square().mean()
+    test_loss.backward()
+    assert sample.grad is not None
+    assert torch.isfinite(sample.grad).all()
+    assert rms_norm.weight.grad is not None
+    assert torch.isfinite(rms_norm.weight.grad).all()
+
+
+def calculate_swiglu_hidden_dim(
+    embedding_dim: int,
+    multiple_of: int = FEED_FORWARD_MULTIPLE_OF,
+) -> int:
+    """Return a hardware-aligned SwiGLU width near 8/3 of Model width."""
+    if embedding_dim <= 0:
+        raise ValueError("SwiGLU Embedding Dimension must be positive.")
+
+    if multiple_of <= 0:
+        raise ValueError("SwiGLU alignment multiple must be positive.")
+
+    target_hidden_dim = 8 * embedding_dim / 3
+    return int(
+        multiple_of
+        * ((target_hidden_dim + multiple_of - 1) // multiple_of)
+    )
+
+
 class FeedForwardNetwork(nn.Module):
-    """Process every Token independently with a nonlinear MLP.
+    """Process every Token independently with a gated SwiGLU MLP.
 
     Input and Output Shape:
         (batch_size, time, embedding_dim)
@@ -828,30 +1044,79 @@ class FeedForwardNetwork(nn.Module):
     def __init__(
         self,
         embedding_dim: int,
-        expansion_factor: int,
+        hidden_dim: int,
     ) -> None:
         super().__init__()
 
-        if expansion_factor <= 0:
-            raise ValueError("Feed-Forward Expansion Factor must be positive.")
+        if hidden_dim <= 0:
+            raise ValueError("SwiGLU Hidden Dimension must be positive.")
 
-        hidden_dim = expansion_factor * embedding_dim
-
-        self.network = nn.Sequential(
-            nn.Linear(
-                in_features=embedding_dim,
-                out_features=hidden_dim,
-            ),
-            nn.GELU(),
-            nn.Linear(
-                in_features=hidden_dim,
-                out_features=embedding_dim,
-            ),
+        self.hidden_dim = hidden_dim
+        self.gate_projection = nn.Linear(
+            in_features=embedding_dim,
+            out_features=hidden_dim,
+            bias=False,
+        )
+        self.up_projection = nn.Linear(
+            in_features=embedding_dim,
+            out_features=hidden_dim,
+            bias=False,
+        )
+        self.down_projection = nn.Linear(
+            in_features=hidden_dim,
+            out_features=embedding_dim,
+            bias=False,
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        """Apply the same MLP to every Token Vector."""
-        return self.network(x)
+        """Gate the learned Value Path before projecting back to Model width."""
+        gate = F.silu(
+            self.gate_projection(x)
+        )
+        value = self.up_projection(x)
+        hidden = gate * value
+        return self.down_projection(hidden)
+
+
+def verify_swiglu_feed_forward() -> None:
+    """Check aligned width, Shape, gating, Parameters, and Gradient Flow."""
+    hidden_dim = calculate_swiglu_hidden_dim(
+        embedding_dim=EMBEDDING_DIM,
+        multiple_of=FEED_FORWARD_MULTIPLE_OF,
+    )
+    assert hidden_dim == 176
+    assert calculate_swiglu_hidden_dim(384, 16) == 1024
+
+    feed_forward = FeedForwardNetwork(
+        embedding_dim=EMBEDDING_DIM,
+        hidden_dim=hidden_dim,
+    )
+    sample = torch.randn(
+        2,
+        4,
+        EMBEDDING_DIM,
+        requires_grad=True,
+    )
+    output = feed_forward(sample)
+
+    assert output.shape == sample.shape
+    assert feed_forward.gate_projection.weight.data_ptr() != (
+        feed_forward.up_projection.weight.data_ptr()
+    )
+    expected_weight_count = 3 * EMBEDDING_DIM * hidden_dim
+    assert sum(
+        parameter.numel()
+        for parameter in feed_forward.parameters()
+    ) == expected_weight_count
+
+    test_loss = output.square().mean()
+    test_loss.backward()
+    assert sample.grad is not None
+    assert torch.isfinite(sample.grad).all()
+
+    for parameter in feed_forward.parameters():
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
 
 
 TransformerBlockKVCache = PackedKVCache
@@ -860,9 +1125,9 @@ TransformerBlockKVCache = PackedKVCache
 class TransformerBlock(nn.Module):
     """Combine Token communication and per-Token nonlinear processing.
 
-    This Block uses the Pre-LayerNorm layout:
-        x = x + Attention(LayerNorm(x))
-        x = x + FeedForward(LayerNorm(x))
+    This Block uses the Pre-RMSNorm layout:
+        x = x + Attention(RMSNorm(x))
+        x = x + FeedForward(RMSNorm(x))
 
     Input and Output Shape:
         (batch_size, time, embedding_dim)
@@ -873,23 +1138,32 @@ class TransformerBlock(nn.Module):
         embedding_dim: int,
         num_heads: int,
         block_size: int,
-        expansion_factor: int,
+        feed_forward_dim: int,
         num_kv_heads: int | None = None,
+        rope_base: float = ROPE_BASE,
+        rms_norm_eps: float = RMS_NORM_EPSILON,
     ) -> None:
         super().__init__()
 
-        self.layer_norm_1 = nn.LayerNorm(embedding_dim)
+        self.attention_norm = RMSNorm(
+            embedding_dim=embedding_dim,
+            eps=rms_norm_eps,
+        )
         self.attention = MultiHeadCausalSelfAttention(
             embedding_dim=embedding_dim,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             block_size=block_size,
+            rope_base=rope_base,
         )
 
-        self.layer_norm_2 = nn.LayerNorm(embedding_dim)
+        self.feed_forward_norm = RMSNorm(
+            embedding_dim=embedding_dim,
+            eps=rms_norm_eps,
+        )
         self.feed_forward = FeedForwardNetwork(
             embedding_dim=embedding_dim,
-            expansion_factor=expansion_factor,
+            hidden_dim=feed_forward_dim,
         )
 
     def forward(
@@ -900,13 +1174,13 @@ class TransformerBlock(nn.Module):
     ) -> tuple[Tensor, TransformerBlockKVCache | None]:
         """Run both Residual Branches and return this Layer's optional Cache."""
         attention_output, present_key_values = self.attention(
-            self.layer_norm_1(x),
+            self.attention_norm(x),
             past_key_value=past_key_value,
             use_cache=use_cache,
         )
         x = x + attention_output
         x = x + self.feed_forward(
-            self.layer_norm_2(x)
+            self.feed_forward_norm(x)
         )
 
         return x, present_key_values
@@ -918,7 +1192,7 @@ def verify_transformer_block() -> None:
         embedding_dim=EMBEDDING_DIM,
         num_heads=NUM_HEADS,
         block_size=BLOCK_SIZE,
-        expansion_factor=FEED_FORWARD_EXPANSION,
+        feed_forward_dim=calculate_swiglu_hidden_dim(EMBEDDING_DIM),
     )
 
     sample = torch.randn(
@@ -986,8 +1260,10 @@ class DeerlightGPTLanguageModel(nn.Module):
         num_heads: int,
         num_layers: int,
         block_size: int,
-        expansion_factor: int,
+        feed_forward_dim: int,
         num_kv_heads: int | None = None,
+        rope_base: float = ROPE_BASE,
+        rms_norm_eps: float = RMS_NORM_EPSILON,
     ) -> None:
         super().__init__()
 
@@ -997,13 +1273,9 @@ class DeerlightGPTLanguageModel(nn.Module):
         self.block_size = block_size
         self.vocab_size = vocab_size
 
-        # Module 1: Represent both Token Identity and absolute Position.
+        # Module 1: Represent Token Identity; RoPE is applied inside Attention.
         self.token_embedding_table = nn.Embedding(
             num_embeddings=vocab_size,
-            embedding_dim=embedding_dim,
-        )
-        self.position_embedding_table = nn.Embedding(
-            num_embeddings=block_size,
             embedding_dim=embedding_dim,
         )
 
@@ -1014,13 +1286,18 @@ class DeerlightGPTLanguageModel(nn.Module):
                 num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
                 block_size=block_size,
-                expansion_factor=expansion_factor,
+                feed_forward_dim=feed_forward_dim,
+                rope_base=rope_base,
+                rms_norm_eps=rms_norm_eps,
             )
             for _ in range(num_layers)
         ])
 
         # Module 3: Normalize the final internal Representation.
-        self.final_layer_norm = nn.LayerNorm(embedding_dim)
+        self.final_norm = RMSNorm(
+            embedding_dim=embedding_dim,
+            eps=rms_norm_eps,
+        )
 
         # Module 4: Convert each Token Vector into Vocabulary Logits.
         self.language_model_head = nn.Linear(
@@ -1068,17 +1345,8 @@ class DeerlightGPTLanguageModel(nn.Module):
                 f"Block Size {self.block_size}."
             )
 
-        # Module 1: Build position-aware Token Representations.
-        token_embeddings = self.token_embedding_table(token_ids)
-
-        position_ids = torch.arange(
-            past_length,
-            past_length + time,
-            device=token_ids.device,
-        )
-        position_embeddings = self.position_embedding_table(position_ids)
-
-        x = token_embeddings + position_embeddings
+        # Module 1: Build Content Representations. Attention adds RoPE Positions.
+        x = self.token_embedding_table(token_ids)
 
         # Module 2: Let all Transformer Blocks process the Sequence.
         present_key_values = []
@@ -1103,7 +1371,7 @@ class DeerlightGPTLanguageModel(nn.Module):
                 present_key_values.append(layer_present_key_values)
 
         # Module 3: Produce one Vocabulary Score per Token and Position.
-        x = self.final_layer_norm(x)
+        x = self.final_norm(x)
         logits = self.language_model_head(x)
 
         expected_shape = (batch_size, time, self.vocab_size)
@@ -1202,8 +1470,8 @@ class DeerlightGPTLanguageModel(nn.Module):
                 first_layer_keys, _ = first_layer_cache
 
                 if first_layer_keys.shape[2] >= self.block_size:
-                    # Learned absolute Position Embeddings cannot append beyond
-                    # block_size. Re-prefill the shifted Window next iteration.
+                    # The fixed Causal Mask supports at most block_size Keys.
+                    # Re-prefill the shifted Context Window next iteration.
                     past_key_values = None
 
         return token_ids
@@ -1219,7 +1487,7 @@ def verify_deerlight_gpt() -> None:
         num_heads=NUM_HEADS,
         num_layers=NUM_LAYERS,
         block_size=BLOCK_SIZE,
-        expansion_factor=FEED_FORWARD_EXPANSION,
+        feed_forward_dim=calculate_swiglu_hidden_dim(EMBEDDING_DIM),
     )
 
     token_ids = torch.randint(
@@ -1240,6 +1508,14 @@ def verify_deerlight_gpt() -> None:
     assert loss is not None
     assert loss.ndim == 0
     assert torch.isfinite(loss)
+    assert not any(
+        isinstance(module, nn.LayerNorm)
+        for module in model.modules()
+    )
+    assert sum(
+        isinstance(module, RMSNorm)
+        for module in model.modules()
+    ) == NUM_LAYERS * 2 + 1
 
     # Cached Model Decode must match the final Position of a Full Forward.
     _, _, prefill_cache = model(
@@ -1359,7 +1635,7 @@ def train_deerlight_gpt(
     batch_size: int,
     block_size: int,
     checkpoint_path: Path | None = None,
-    model_config: dict[str, int] | None = None,
+    model_config: dict[str, int | float] | None = None,
     characters: list[str] | None = None,
 ) -> None:
     """Train every Deerlight GPT Parameter end to end with AdamW."""
@@ -1458,7 +1734,7 @@ def save_deerlight_checkpoint(
     step: int,
     training_loss: float,
     validation_loss: float,
-    model_config: dict[str, int],
+    model_config: dict[str, int | float],
     characters: list[str],
 ) -> None:
     """Atomically save Model, Optimizer, Metrics, Config, and Vocabulary."""
@@ -1484,63 +1760,6 @@ def save_deerlight_checkpoint(
     temporary_path.replace(checkpoint_path)
 
 
-def migrate_legacy_mha_state_dict(
-    state_dict: dict[str, Tensor],
-    num_layers: int,
-    num_heads: int,
-) -> dict[str, Tensor]:
-    """Pack legacy independent MHA Head Weights without changing the Model."""
-    legacy_marker = "transformer_blocks.0.attention.heads.0.query.weight"
-
-    if legacy_marker not in state_dict:
-        return state_dict
-
-    migrated = dict(state_dict)
-
-    for layer_index in range(num_layers):
-        attention_prefix = f"transformer_blocks.{layer_index}.attention"
-        query_weights = []
-        key_weights = []
-        value_weights = []
-        causal_mask = None
-
-        for head_index in range(num_heads):
-            head_prefix = f"{attention_prefix}.heads.{head_index}"
-            query_weights.append(
-                migrated.pop(f"{head_prefix}.query.weight")
-            )
-            key_weights.append(
-                migrated.pop(f"{head_prefix}.key.weight")
-            )
-            value_weights.append(
-                migrated.pop(f"{head_prefix}.value.weight")
-            )
-            head_mask = migrated.pop(f"{head_prefix}.causal_mask")
-
-            if causal_mask is None:
-                causal_mask = head_mask
-
-        migrated[f"{attention_prefix}.query_projection.weight"] = torch.cat(
-            query_weights,
-            dim=0,
-        )
-        migrated[f"{attention_prefix}.key_projection.weight"] = torch.cat(
-            key_weights,
-            dim=0,
-        )
-        migrated[f"{attention_prefix}.value_projection.weight"] = torch.cat(
-            value_weights,
-            dim=0,
-        )
-
-        if causal_mask is None:
-            raise RuntimeError("Legacy Attention State did not contain a Causal Mask.")
-
-        migrated[f"{attention_prefix}.causal_mask"] = causal_mask
-
-    return migrated
-
-
 def load_deerlight_checkpoint(
     checkpoint_path: Path,
     device: torch.device,
@@ -1556,29 +1775,21 @@ def load_deerlight_checkpoint(
         map_location=device,
         weights_only=True,
     )
-    model_config = dict(checkpoint["model_config"])
-    model_config.setdefault(
-        "num_kv_heads",
-        model_config["num_heads"],
-    )
-    checkpoint["model_config"] = model_config
+    model_config = checkpoint["model_config"]
 
     model = DeerlightGPTLanguageModel(
         vocab_size=model_config["vocab_size"],
         embedding_dim=model_config["embedding_dim"],
         num_heads=model_config["num_heads"],
         num_kv_heads=model_config["num_kv_heads"],
+        rope_base=model_config["rope_base"],
+        rms_norm_eps=model_config["rms_norm_eps"],
         num_layers=model_config["num_layers"],
         block_size=model_config["block_size"],
-        expansion_factor=model_config["expansion_factor"],
+        feed_forward_dim=model_config["feed_forward_dim"],
     ).to(device)
 
-    model_state_dict = migrate_legacy_mha_state_dict(
-        state_dict=checkpoint["model_state_dict"],
-        num_layers=model_config["num_layers"],
-        num_heads=model_config["num_heads"],
-    )
-    model.load_state_dict(model_state_dict)
+    model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
     return model, checkpoint
@@ -1635,6 +1846,15 @@ def main() -> None:
     verify_single_head_attention()
     print("\nAll Milestone 3 checks passed.")
 
+    verify_rotary_position_embedding()
+    print("All Milestone 11 RoPE checks passed.")
+
+    verify_rms_norm()
+    print("All Milestone 12 RMSNorm checks passed.")
+
+    verify_swiglu_feed_forward()
+    print("All Milestone 13 SwiGLU checks passed.")
+
     verify_multi_head_attention()
     print("All Milestone 4 checks passed.")
 
@@ -1647,14 +1867,21 @@ def main() -> None:
     # Reset the Random Seed so verification does not affect Training.
     torch.manual_seed(SEED)
 
+    feed_forward_dim = calculate_swiglu_hidden_dim(
+        embedding_dim=EMBEDDING_DIM,
+        multiple_of=FEED_FORWARD_MULTIPLE_OF,
+    )
+
     model_config = {
         "vocab_size": len(characters),
         "embedding_dim": EMBEDDING_DIM,
         "num_heads": NUM_HEADS,
         "num_kv_heads": NUM_KV_HEADS,
+        "rope_base": ROPE_BASE,
+        "rms_norm_eps": RMS_NORM_EPSILON,
         "num_layers": NUM_LAYERS,
         "block_size": BLOCK_SIZE,
-        "expansion_factor": FEED_FORWARD_EXPANSION,
+        "feed_forward_dim": feed_forward_dim,
     }
 
     model = DeerlightGPTLanguageModel(
@@ -1662,9 +1889,11 @@ def main() -> None:
         embedding_dim=EMBEDDING_DIM,
         num_heads=NUM_HEADS,
         num_kv_heads=NUM_KV_HEADS,
+        rope_base=ROPE_BASE,
+        rms_norm_eps=RMS_NORM_EPSILON,
         num_layers=NUM_LAYERS,
         block_size=BLOCK_SIZE,
-        expansion_factor=FEED_FORWARD_EXPANSION,
+        feed_forward_dim=feed_forward_dim,
     ).to(DEVICE)
 
     parameter_count = sum(

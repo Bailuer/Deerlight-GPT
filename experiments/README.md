@@ -16,3 +16,6 @@ Each experiment should record:
 - [Sampling Temperature with Fixed Top-k](sampling-temperature.md)
 - [KV Cache Latency](kv-cache-latency.md)
 - [MHA vs GQA vs MQA](mha-gqa-mqa.md)
+- [RoPE Architecture Verification](rope-verification.md)
+- [RMSNorm Architecture Verification](rmsnorm-verification.md)
+- [SwiGLU Architecture Verification](swiglu-verification.md)

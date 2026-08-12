@@ -1,6 +1,8 @@
 # MHA vs GQA vs MQA
 
-Date: 2026-08-11
+Original experiment date: 2026-08-11
+
+Re-run on the RoPE + RMSNorm + SwiGLU Architecture: 2026-08-13
 
 ## Question
 
@@ -24,6 +26,9 @@ persistent KV Cache size, and cached Generation latency in Deerlight GPT?
 - Warm-up Runs: 2
 - Measured Runs: 10
 - Seed: 1337, reset before creating each Model
+- Position Encoding: RoPE
+- Normalization: RMSNorm
+- Feed-Forward Network: SwiGLU with Hidden Dimension 176
 
 All Models were randomly initialized. This experiment measures Architecture
 costs, not trained Language Modeling quality.
@@ -45,23 +50,23 @@ For MHA, GQA, and MQA independently:
 - Cached one-Token Decode matches the corresponding Full Forward Output.
 - Cache Shape is `(B,num_kv_heads,T,head_size)`.
 
-The legacy trained MHA Checkpoint was also migrated from independent Head
-Weights to packed Projection Weights. Its migrated Logits had a maximum
-absolute difference of `0.0` from the pre-refactor Reference Logits.
+The original packed-Attention refactor also verified a lossless migration of the
+legacy trained MHA Checkpoint. RoPE/RMSNorm/SwiGLU subsequently changed the
+Model function and use separate Architecture Checkpoints.
 
 ## Results
 
 | Architecture | KV Heads | Parameters | KV Cache Bytes | Mean Latency |
 |---|---:|---:|---:|---:|
-| MHA | 4 | 112,193 | 65,536 | 76.003 ms |
-| GQA | 2 | 104,001 | 32,768 | 80.506 ms |
-| MQA | 1 | 99,905 | 16,384 | 83.146 ms |
+| MHA | 4 | 109,185 | 65,536 | 148.258 ms |
+| GQA | 2 | 100,993 | 32,768 | 156.766 ms |
+| MQA | 1 | 96,897 | 16,384 | 156.571 ms |
 
 Relative to MHA:
 
-- GQA uses 50% of the persistent KV Cache and 7.3% fewer Parameters.
-- MQA uses 25% of the persistent KV Cache and 11.0% fewer Parameters.
-- GQA was 5.9% slower and MQA was 9.4% slower in this tiny-model benchmark.
+- GQA uses 50% of the persistent KV Cache and 7.5% fewer Parameters.
+- MQA uses 25% of the persistent KV Cache and 11.3% fewer Parameters.
+- GQA was 5.7% slower and MQA was 5.6% slower in this tiny-model benchmark.
 
 ## Interpretation
 

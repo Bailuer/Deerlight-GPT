@@ -17,11 +17,11 @@ The first working version will use:
 
 - Character-level Tokenizer
 - Token Embedding
-- Learned Position Embedding
+- Rotary Position Embedding (RoPE)
 - Configurable packed MHA / GQA / MQA
 - Residual Connections
-- LayerNorm
-- GELU Feed-Forward Network
+- RMSNorm
+- SwiGLU Feed-Forward Network
 - Vocabulary Projection
 - Cross-Entropy Loss
 - AdamW
@@ -46,9 +46,9 @@ The first working version will use:
 
 - [x] KV Cache
 - [x] MQA / GQA
-- [ ] RoPE
-- [ ] RMSNorm
-- [ ] SwiGLU
+- [x] RoPE
+- [x] RMSNorm
+- [x] SwiGLU
 - [ ] PyTorch SDPA / Flash Attention
 - [ ] Mixture of Experts
 - [ ] Scaling Law Experiments
@@ -105,7 +105,8 @@ python -m pip install torch==2.12.1 --index-url https://download.pytorch.org/whl
 
 ## Current Milestone
 
-Milestone 10 complete: packed MHA/GQA/MQA, unexpanded KV Caches, cached Decode,
-and legacy independent-Head MHA Checkpoint migration are verified.
+Milestone 13 complete: a bias-free, hardware-aligned SwiGLU Feed-Forward
+Network replaces the GELU MLP and passes end-to-end Gradient and Cache checks.
 
-Next: replace learned absolute Position Embeddings with RoPE.
+Next: configure and train Deerlight GPT Medium as the modern Architecture
+capability baseline.
