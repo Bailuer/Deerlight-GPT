@@ -14,6 +14,7 @@ MEDIUM_EMBEDDING_DIM = 384
 MEDIUM_NUM_QUERY_HEADS = 6
 MEDIUM_NUM_KV_HEADS = 2
 MEDIUM_NUM_LAYERS = 6
+MEDIUM_ATTENTION_BACKEND = "sdpa_cudnn"
 MEDIUM_BLOCK_SIZE = 256
 MEDIUM_BATCH_SIZE = 32
 MEDIUM_LEARNING_RATE = 3e-4
@@ -57,7 +58,10 @@ def synchronize() -> None:
         torch.cuda.synchronize()
 
 
-def build_model_config(vocab_size: int) -> dict[str, int | float]:
+def build_model_config(
+    vocab_size: int,
+    attention_backend: str,
+) -> dict[str, int | float | str]:
     """Return the complete reproducible Medium Architecture configuration."""
     feed_forward_dim = deerlight.calculate_swiglu_hidden_dim(
         embedding_dim=MEDIUM_EMBEDDING_DIM,
@@ -74,6 +78,7 @@ def build_model_config(vocab_size: int) -> dict[str, int | float]:
         "num_layers": MEDIUM_NUM_LAYERS,
         "block_size": MEDIUM_BLOCK_SIZE,
         "feed_forward_dim": feed_forward_dim,
+        "attention_backend": attention_backend,
     }
 
 
@@ -128,6 +133,11 @@ def parse_arguments() -> Namespace:
     )
     parser.add_argument("--steps", type=int)
     parser.add_argument("--batch-size", type=int, default=MEDIUM_BATCH_SIZE)
+    parser.add_argument(
+        "--attention-backend",
+        choices=("manual", "sdpa", "sdpa_cudnn"),
+        default=MEDIUM_ATTENTION_BACKEND,
+    )
     return parser.parse_args()
 
 
@@ -182,7 +192,10 @@ def main() -> None:
         data,
         deerlight.TRAIN_FRACTION,
     )
-    model_config = build_model_config(len(characters))
+    model_config = build_model_config(
+        len(characters),
+        attention_backend=args.attention_backend,
+    )
     model = deerlight.DeerlightGPTLanguageModel(
         **model_config,
     ).to(deerlight.DEVICE)

@@ -20,3 +20,4 @@ Each experiment should record:
 - [RMSNorm Architecture Verification](rmsnorm-verification.md)
 - [SwiGLU Architecture Verification](swiglu-verification.md)
 - [Medium Capability Baseline](medium-capability-baseline.md)
+- [SDPA and Fused Attention](sdpa-fused-attention.md)

@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 # -----------------------------------------------------------------------------
@@ -28,6 +29,7 @@ EMBEDDING_DIM = 64
 HEAD_SIZE = 16
 NUM_HEADS = 4
 NUM_KV_HEADS = NUM_HEADS
+ATTENTION_BACKEND = "manual"
 ROPE_BASE = 10_000.0
 RMS_NORM_EPSILON = 1e-5
 FEED_FORWARD_MULTIPLE_OF = 16
@@ -679,6 +681,7 @@ class MultiHeadCausalSelfAttention(nn.Module):
         block_size: int,
         num_kv_heads: int | None = None,
         rope_base: float = ROPE_BASE,
+        attention_backend: str = ATTENTION_BACKEND,
     ) -> None:
         super().__init__()
 
@@ -701,11 +704,17 @@ class MultiHeadCausalSelfAttention(nn.Module):
                 "Number of Query Heads must be divisible by Number of KV Heads."
             )
 
+        if attention_backend not in ("manual", "sdpa", "sdpa_cudnn"):
+            raise ValueError(
+                "Attention Backend must be 'manual', 'sdpa', or 'sdpa_cudnn'."
+            )
+
         self.embedding_dim = embedding_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_size = embedding_dim // num_heads
         self.queries_per_kv_head = num_heads // num_kv_heads
+        self.attention_backend = attention_backend
         self.rotary_embedding = RotaryPositionEmbedding(
             head_size=self.head_size,
             base=rope_base,
@@ -827,32 +836,93 @@ class MultiHeadCausalSelfAttention(nn.Module):
                 f"{self.causal_mask.shape[0]}."
             )
 
-        # Logically give every Query Head the KV Head assigned to its Group.
-        attention_keys = keys.repeat_interleave(
-            self.queries_per_kv_head,
-            dim=1,
-        )
-        attention_values = values.repeat_interleave(
-            self.queries_per_kv_head,
-            dim=1,
-        )
-
-        # Shape: (B, num_heads, query_time, key_time)
-        attention_scores = queries @ attention_keys.transpose(-2, -1)
-        attention_scores = attention_scores * (self.head_size ** -0.5)
-
         active_mask = self.causal_mask[
             past_length:past_length + query_time,
             :key_time,
         ]
-        attention_scores = attention_scores.masked_fill(
-            ~active_mask,
-            float("-inf"),
-        )
-        attention_weights = F.softmax(attention_scores, dim=-1)
 
-        # Preserve all Query-Head Outputs even when K/V are shared.
-        head_outputs = attention_weights @ attention_values
+        if self.attention_backend == "manual":
+            # Make the full (B, Heads, Tq, Tk) Matrix visible for learning.
+            attention_keys = keys.repeat_interleave(
+                self.queries_per_kv_head,
+                dim=1,
+            )
+            attention_values = values.repeat_interleave(
+                self.queries_per_kv_head,
+                dim=1,
+            )
+            attention_scores = queries @ attention_keys.transpose(-2, -1)
+            attention_scores = attention_scores * (self.head_size ** -0.5)
+            attention_scores = attention_scores.masked_fill(
+                ~active_mask,
+                float("-inf"),
+            )
+            attention_weights = F.softmax(attention_scores, dim=-1)
+            head_outputs = attention_weights @ attention_values
+        else:
+            # SDPA keeps the same Mathematics but lets PyTorch select a fused
+            # Flash/Memory-Efficient Kernel instead of materializing the full
+            # Attention Score and Weight Matrices in GPU global memory.
+            sdpa_keys = keys
+            sdpa_values = values
+            enable_gqa = self.num_heads != self.num_kv_heads
+
+            if enable_gqa and queries.device.type != "cuda":
+                # Native GQA fused kernels are CUDA-only. Repeating K/V keeps
+                # the CPU reference path mathematically equivalent.
+                sdpa_keys = keys.repeat_interleave(
+                    self.queries_per_kv_head,
+                    dim=1,
+                )
+                sdpa_values = values.repeat_interleave(
+                    self.queries_per_kv_head,
+                    dim=1,
+                )
+                enable_gqa = False
+
+            if past_length == 0:
+                # A square Prefill/Training Sequence uses SDPA's fast Causal path.
+                sdpa_mask = None
+                is_causal = True
+            elif query_time == 1:
+                # The newest cached Token may attend to every historical Key.
+                sdpa_mask = None
+                is_causal = False
+            else:
+                # Multiple new Tokens with a Cache need a Position-offset Mask.
+                sdpa_mask = active_mask
+                is_causal = False
+
+            sdpa_arguments = {
+                "attn_mask": sdpa_mask,
+                "dropout_p": 0.0,
+                "is_causal": is_causal,
+                "enable_gqa": enable_gqa,
+            }
+
+            if (
+                self.attention_backend == "sdpa_cudnn"
+                and queries.device.type == "cuda"
+                and queries.dtype in (torch.float16, torch.bfloat16)
+                and past_length == 0
+            ):
+                # This Windows PyTorch Build lacks FlashAttention-2 but ships
+                # a working fused cuDNN Attention kernel. Force it for square
+                # Training/Prefill instead of silently falling back to Math.
+                with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+                    head_outputs = F.scaled_dot_product_attention(
+                        queries,
+                        sdpa_keys,
+                        sdpa_values,
+                        **sdpa_arguments,
+                    )
+            else:
+                head_outputs = F.scaled_dot_product_attention(
+                    queries,
+                    sdpa_keys,
+                    sdpa_values,
+                    **sdpa_arguments,
+                )
         concatenated = head_outputs.transpose(1, 2).contiguous().view(
             batch_size,
             query_time,
@@ -937,6 +1007,117 @@ def verify_multi_head_attention() -> None:
 
     assert cache_elements[NUM_HEADS] == 2 * cache_elements[NUM_HEADS // 2]
     assert cache_elements[NUM_HEADS] == 4 * cache_elements[1]
+
+
+def verify_sdpa_equivalence() -> None:
+    """Compare manual and SDPA Forward, Backward, and cached Decode paths."""
+    for num_kv_heads in (NUM_HEADS, NUM_HEADS // 2, 1):
+        manual_attention = MultiHeadCausalSelfAttention(
+            embedding_dim=EMBEDDING_DIM,
+            num_heads=NUM_HEADS,
+            num_kv_heads=num_kv_heads,
+            block_size=BLOCK_SIZE,
+            attention_backend="manual",
+        )
+        sdpa_attention = MultiHeadCausalSelfAttention(
+            embedding_dim=EMBEDDING_DIM,
+            num_heads=NUM_HEADS,
+            num_kv_heads=num_kv_heads,
+            block_size=BLOCK_SIZE,
+            attention_backend="sdpa",
+        )
+        sdpa_attention.load_state_dict(manual_attention.state_dict())
+
+        manual_input = torch.randn(
+            2,
+            6,
+            EMBEDDING_DIM,
+            requires_grad=True,
+        )
+        sdpa_input = manual_input.detach().clone().requires_grad_(True)
+
+        manual_output, _ = manual_attention(manual_input)
+        sdpa_output, _ = sdpa_attention(sdpa_input)
+        assert torch.allclose(
+            sdpa_output,
+            manual_output,
+            atol=1e-5,
+            rtol=1e-4,
+        )
+
+        output_gradient = torch.randn_like(manual_output)
+        manual_output.backward(output_gradient)
+        sdpa_output.backward(output_gradient)
+        assert torch.allclose(
+            sdpa_input.grad,
+            manual_input.grad,
+            atol=1e-5,
+            rtol=1e-4,
+        )
+
+        manual_parameters = dict(manual_attention.named_parameters())
+        sdpa_parameters = dict(sdpa_attention.named_parameters())
+
+        for name, manual_parameter in manual_parameters.items():
+            sdpa_parameter = sdpa_parameters[name]
+            assert manual_parameter.grad is not None
+            assert sdpa_parameter.grad is not None
+            assert torch.allclose(
+                sdpa_parameter.grad,
+                manual_parameter.grad,
+                atol=2e-5,
+                rtol=2e-4,
+            )
+
+        cache_input = torch.randn(2, 7, EMBEDDING_DIM)
+        _, manual_cache = manual_attention(
+            cache_input[:, :3],
+            use_cache=True,
+        )
+        _, sdpa_cache = sdpa_attention(
+            cache_input[:, :3],
+            use_cache=True,
+        )
+        assert manual_cache is not None
+        assert sdpa_cache is not None
+
+        # Exercise the Position-offset Boolean Mask with two new Tokens.
+        manual_chunk, manual_cache = manual_attention(
+            cache_input[:, 3:5],
+            past_key_value=manual_cache,
+            use_cache=True,
+        )
+        sdpa_chunk, sdpa_cache = sdpa_attention(
+            cache_input[:, 3:5],
+            past_key_value=sdpa_cache,
+            use_cache=True,
+        )
+        assert manual_cache is not None
+        assert sdpa_cache is not None
+        assert torch.allclose(
+            sdpa_chunk,
+            manual_chunk,
+            atol=1e-5,
+            rtol=1e-4,
+        )
+
+        # Exercise the unmasked single-Token cached Decode fast path.
+        manual_token, _ = manual_attention(
+            cache_input[:, 5:6],
+            past_key_value=manual_cache,
+            use_cache=True,
+        )
+        sdpa_token, _ = sdpa_attention(
+            cache_input[:, 5:6],
+            past_key_value=sdpa_cache,
+            use_cache=True,
+        )
+        assert torch.allclose(
+            sdpa_token,
+            manual_token,
+            atol=1e-5,
+            rtol=1e-4,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -1142,6 +1323,7 @@ class TransformerBlock(nn.Module):
         num_kv_heads: int | None = None,
         rope_base: float = ROPE_BASE,
         rms_norm_eps: float = RMS_NORM_EPSILON,
+        attention_backend: str = ATTENTION_BACKEND,
     ) -> None:
         super().__init__()
 
@@ -1155,6 +1337,7 @@ class TransformerBlock(nn.Module):
             num_kv_heads=num_kv_heads,
             block_size=block_size,
             rope_base=rope_base,
+            attention_backend=attention_backend,
         )
 
         self.feed_forward_norm = RMSNorm(
@@ -1264,6 +1447,7 @@ class DeerlightGPTLanguageModel(nn.Module):
         num_kv_heads: int | None = None,
         rope_base: float = ROPE_BASE,
         rms_norm_eps: float = RMS_NORM_EPSILON,
+        attention_backend: str = ATTENTION_BACKEND,
     ) -> None:
         super().__init__()
 
@@ -1289,6 +1473,7 @@ class DeerlightGPTLanguageModel(nn.Module):
                 feed_forward_dim=feed_forward_dim,
                 rope_base=rope_base,
                 rms_norm_eps=rms_norm_eps,
+                attention_backend=attention_backend,
             )
             for _ in range(num_layers)
         ])
@@ -1635,7 +1820,7 @@ def train_deerlight_gpt(
     batch_size: int,
     block_size: int,
     checkpoint_path: Path | None = None,
-    model_config: dict[str, int | float] | None = None,
+    model_config: dict[str, int | float | str] | None = None,
     characters: list[str] | None = None,
 ) -> None:
     """Train every Deerlight GPT Parameter end to end with AdamW."""
@@ -1734,7 +1919,7 @@ def save_deerlight_checkpoint(
     step: int,
     training_loss: float,
     validation_loss: float,
-    model_config: dict[str, int | float],
+    model_config: dict[str, int | float | str],
     characters: list[str],
 ) -> None:
     """Atomically save Model, Optimizer, Metrics, Config, and Vocabulary."""
@@ -1787,6 +1972,10 @@ def load_deerlight_checkpoint(
         num_layers=model_config["num_layers"],
         block_size=model_config["block_size"],
         feed_forward_dim=model_config["feed_forward_dim"],
+        attention_backend=model_config.get(
+            "attention_backend",
+            ATTENTION_BACKEND,
+        ),
     ).to(device)
 
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -1858,6 +2047,9 @@ def main() -> None:
     verify_multi_head_attention()
     print("All Milestone 4 checks passed.")
 
+    verify_sdpa_equivalence()
+    print("All Milestone 15 SDPA equivalence checks passed.")
+
     verify_transformer_block()
     print("All Milestone 5 checks passed.")
 
@@ -1882,6 +2074,7 @@ def main() -> None:
         "num_layers": NUM_LAYERS,
         "block_size": BLOCK_SIZE,
         "feed_forward_dim": feed_forward_dim,
+        "attention_backend": ATTENTION_BACKEND,
     }
 
     model = DeerlightGPTLanguageModel(
@@ -1894,6 +2087,7 @@ def main() -> None:
         num_layers=NUM_LAYERS,
         block_size=BLOCK_SIZE,
         feed_forward_dim=feed_forward_dim,
+        attention_backend=ATTENTION_BACKEND,
     ).to(DEVICE)
 
     parameter_count = sum(

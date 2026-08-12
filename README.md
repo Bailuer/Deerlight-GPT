@@ -49,7 +49,8 @@ The first working version will use:
 - [x] RoPE
 - [x] RMSNorm
 - [x] SwiGLU
-- [ ] PyTorch SDPA / Flash Attention
+- [x] PyTorch SDPA / Fused cuDNN Attention
+- [ ] FlashAttention-2 Kernel (not included in the tested Windows PyTorch Wheel)
 - [ ] Mixture of Experts
 - [ ] Scaling Law Experiments
 
@@ -107,9 +108,11 @@ Then train the 9.49M-Parameter Medium capability baseline:
 python train_medium.py --mode train
 ```
 
-The Medium script uses BF16 Autocast and fused AdamW on CUDA, clips the
-Gradient Norm, applies Early Stopping, and generates from the Best Validation
-Checkpoint rather than the final training state.
+The Medium script uses BF16 Autocast, fused AdamW, and fused cuDNN Attention on
+the tested CUDA environment. It clips the Gradient Norm, applies Early
+Stopping, and generates from the Best Validation Checkpoint rather than the
+final training state. Use `--attention-backend manual` to retain the transparent
+Attention path or `--attention-backend sdpa` to inspect automatic SDPA dispatch.
 
 The training script automatically uses CUDA when a CUDA-enabled PyTorch build
 is available, and otherwise falls back to CPU.
@@ -123,11 +126,11 @@ python -m pip install torch==2.12.1 --index-url https://download.pytorch.org/whl
 
 ## Current Milestone
 
-Milestone 14 complete: the 9.49M-Parameter Medium GQA model has a reproducible
-CUDA training entry point and a recorded capability baseline. Its Best
-Validation Loss was `1.5610` at Step 1000; continuing to Step 5000 caused clear
-Overfitting despite falling Training Loss.
+Milestone 15 complete: manual Attention and PyTorch SDPA now pass Forward,
+Backward, GQA, and KV Cache equivalence tests. On the tested Windows PyTorch
+Build, automatic SDPA fell back to the Math backend and FlashAttention-2 was not
+compiled, while forced fused cuDNN Attention increased Medium training
+throughput by 33.7% and reduced Peak Allocated VRAM by 25.7%.
 
-Next: replace the transparent Attention kernel with PyTorch SDPA and measure
-whether the Flash Attention backend improves speed and memory without changing
-model outputs.
+Next: learn and implement a small Mixture of Experts Feed-Forward layer, then
+measure Expert utilization and Load-Balancing Loss before scaling it.
