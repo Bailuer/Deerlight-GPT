@@ -126,11 +126,12 @@ python -m pip install torch==2.12.1 --index-url https://download.pytorch.org/whl
 
 ## Current Milestone
 
-Milestone 15 complete: manual Attention and PyTorch SDPA now pass Forward,
-Backward, GQA, and KV Cache equivalence tests. On the tested Windows PyTorch
-Build, automatic SDPA fell back to the Math backend and FlashAttention-2 was not
-compiled, while forced fused cuDNN Attention increased Medium training
-throughput by 33.7% and reduced Peak Allocated VRAM by 25.7%.
+Milestone 16 complete: a transparent Sparse MoE Feed-Forward layer now supports
+Top-k Token Routing, fine-grained SwiGLU Routed Experts, one always-active Shared
+Expert, loss-free Routing Bias updates, Expert Load monitoring, and weighted
+Scatter-Add combination. MoE can be enabled only on selected Transformer Blocks,
+while the default Dense path remains compatible with existing Checkpoints.
 
-Next: learn and implement a small Mixture of Experts Feed-Forward layer, then
-measure Expert utilization and Load-Balancing Loss before scaling it.
+Next: run a controlled Dense-vs-MoE Pilot with matched Active Hidden Capacity,
+then compare parameter count, throughput, memory, validation loss, and Expert
+utilization before enabling MoE in a longer training run.

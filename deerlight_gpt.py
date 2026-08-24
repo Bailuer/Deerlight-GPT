@@ -1300,6 +1300,249 @@ def verify_swiglu_feed_forward() -> None:
         assert torch.isfinite(parameter.grad).all()
 
 
+# -----------------------------------------------------------------------------
+# Milestone 16: Sparse Mixture of Experts Feed-Forward
+# -----------------------------------------------------------------------------
+
+class SparseMoE(nn.Module):
+    """Route each Token through Top-k SwiGLU Experts and one Shared Expert.
+
+    The loss-free Routing Bias changes Expert selection without changing the
+    learned combination weights. This transparent implementation favors clear
+    Tensor flow over production-grade grouped GEMMs or Expert Parallelism.
+
+    Input and Output Shape:
+        (batch_size, time, embedding_dim)
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        expert_hidden_dim: int,
+        num_experts: int,
+        top_k: int,
+        routing_bias_update_rate: float = 1e-3,
+    ) -> None:
+        super().__init__()
+
+        if embedding_dim <= 0:
+            raise ValueError("MoE Embedding Dimension must be positive.")
+
+        if expert_hidden_dim <= 0:
+            raise ValueError("MoE Expert Hidden Dimension must be positive.")
+
+        if num_experts <= 0:
+            raise ValueError("Number of Routed Experts must be positive.")
+
+        if not 1 <= top_k <= num_experts:
+            raise ValueError(
+                "MoE Top-k must be between one and the number of Experts."
+            )
+
+        if routing_bias_update_rate < 0:
+            raise ValueError(
+                "Routing Bias Update Rate must be non-negative."
+            )
+
+        self.embedding_dim = embedding_dim
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.routing_bias_update_rate = routing_bias_update_rate
+
+        self.router = nn.Linear(
+            in_features=embedding_dim,
+            out_features=num_experts,
+            bias=False,
+        )
+        self.routed_experts = nn.ModuleList([
+            FeedForwardNetwork(
+                embedding_dim=embedding_dim,
+                hidden_dim=expert_hidden_dim,
+            )
+            for _ in range(num_experts)
+        ])
+        self.shared_expert = FeedForwardNetwork(
+            embedding_dim=embedding_dim,
+            hidden_dim=expert_hidden_dim,
+        )
+
+        # This Bias is load-controlled state, not an AdamW-trained Parameter.
+        self.register_buffer(
+            "routing_bias",
+            torch.zeros(num_experts),
+        )
+        # Monitoring state follows the Module to its Device but is not saved.
+        self.register_buffer(
+            "last_load_counts",
+            torch.zeros(num_experts, dtype=torch.long),
+            persistent=False,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Dispatch Tokens, combine Routed Outputs, and add Shared Output."""
+        if x.ndim != 3:
+            raise ValueError(
+                "MoE Input must have Shape (batch_size, time, embedding_dim)."
+            )
+
+        batch_size, time, embedding_dim = x.shape
+
+        if embedding_dim != self.embedding_dim:
+            raise ValueError(
+                f"MoE Input width {embedding_dim} does not match configured "
+                f"width {self.embedding_dim}."
+            )
+
+        flat_x = x.reshape(
+            batch_size * time,
+            embedding_dim,
+        )
+        router_logits = self.router(flat_x)
+
+        # Bias affects the discrete Top-k choice, not output combination weight.
+        selection_scores = (
+            router_logits.float()
+            + self.routing_bias.float()
+        )
+        topk_indices = torch.topk(
+            selection_scores,
+            k=self.top_k,
+            dim=-1,
+        ).indices
+        selected_logits = torch.gather(
+            router_logits,
+            dim=-1,
+            index=topk_indices,
+        )
+        topk_weights = F.softmax(
+            selected_logits,
+            dim=-1,
+            dtype=torch.float32,
+        ).to(flat_x.dtype)
+
+        load_counts = torch.bincount(
+            topk_indices.reshape(-1),
+            minlength=self.num_experts,
+        )
+        self.last_load_counts.copy_(load_counts)
+
+        if self.training and self.routing_bias_update_rate > 0:
+            with torch.no_grad():
+                target_load = (
+                    topk_indices.numel()
+                    / self.num_experts
+                )
+                update_direction = torch.sign(
+                    target_load
+                    - load_counts.to(self.routing_bias.dtype)
+                )
+                self.routing_bias.add_(
+                    self.routing_bias_update_rate
+                    * update_direction
+                )
+
+        routed_output = torch.zeros_like(flat_x)
+
+        for expert_id, expert in enumerate(self.routed_experts):
+            token_indices, topk_slots = torch.where(
+                topk_indices == expert_id
+            )
+
+            if token_indices.numel() == 0:
+                continue
+
+            expert_input = flat_x[token_indices]
+            expert_output = expert(expert_input)
+            expert_weights = topk_weights[
+                token_indices,
+                topk_slots,
+            ].unsqueeze(-1)
+            weighted_output = expert_output * expert_weights
+
+            routed_output.index_add_(
+                dim=0,
+                index=token_indices,
+                source=weighted_output,
+            )
+
+        shared_output = self.shared_expert(flat_x)
+        moe_output = routed_output + shared_output
+
+        return moe_output.reshape(
+            batch_size,
+            time,
+            embedding_dim,
+        )
+
+
+def verify_sparse_moe() -> None:
+    """Check Routing Shapes, Loads, Buffers, Gradients, and Model integration."""
+    embedding_dim = 32
+    expert_hidden_dim = 16
+    num_experts = 4
+    top_k = 2
+    batch_size = 2
+    time = 3
+
+    sparse_moe = SparseMoE(
+        embedding_dim=embedding_dim,
+        expert_hidden_dim=expert_hidden_dim,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    sample = torch.randn(
+        batch_size,
+        time,
+        embedding_dim,
+        requires_grad=True,
+    )
+    output = sparse_moe(sample)
+
+    assert output.shape == sample.shape
+    assert torch.isfinite(output).all()
+    assert sparse_moe.last_load_counts.shape == (num_experts,)
+    assert sparse_moe.last_load_counts.sum().item() == (
+        batch_size * time * top_k
+    )
+    assert "routing_bias" in sparse_moe.state_dict()
+    assert "last_load_counts" not in sparse_moe.state_dict()
+    assert "routing_bias" not in dict(sparse_moe.named_parameters())
+
+    test_loss = output.square().mean()
+    test_loss.backward()
+
+    assert sample.grad is not None
+    assert torch.isfinite(sample.grad).all()
+    assert sparse_moe.router.weight.grad is not None
+    assert torch.isfinite(sparse_moe.router.weight.grad).all()
+    assert sparse_moe.routing_bias.grad is None
+
+    for parameter in sparse_moe.shared_expert.parameters():
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+
+    for expert_id, expert in enumerate(sparse_moe.routed_experts):
+        if sparse_moe.last_load_counts[expert_id].item() == 0:
+            continue
+
+        for parameter in expert.parameters():
+            assert parameter.grad is not None
+            assert torch.isfinite(parameter.grad).all()
+
+    # Evaluation records Loads but must not mutate the load-control Bias.
+    sparse_moe.eval()
+    bias_before_evaluation = sparse_moe.routing_bias.clone()
+
+    with torch.no_grad():
+        evaluation_output = sparse_moe(sample.detach())
+
+    assert evaluation_output.shape == sample.shape
+    assert torch.equal(
+        sparse_moe.routing_bias,
+        bias_before_evaluation,
+    )
+
+
 TransformerBlockKVCache = PackedKVCache
 
 
@@ -1324,6 +1567,11 @@ class TransformerBlock(nn.Module):
         rope_base: float = ROPE_BASE,
         rms_norm_eps: float = RMS_NORM_EPSILON,
         attention_backend: str = ATTENTION_BACKEND,
+        use_moe: bool = False,
+        moe_expert_hidden_dim: int | None = None,
+        moe_num_experts: int = 8,
+        moe_top_k: int = 2,
+        moe_routing_bias_update_rate: float = 1e-3,
     ) -> None:
         super().__init__()
 
@@ -1344,10 +1592,24 @@ class TransformerBlock(nn.Module):
             embedding_dim=embedding_dim,
             eps=rms_norm_eps,
         )
-        self.feed_forward = FeedForwardNetwork(
-            embedding_dim=embedding_dim,
-            hidden_dim=feed_forward_dim,
-        )
+        if use_moe:
+            resolved_expert_hidden_dim = (
+                feed_forward_dim
+                if moe_expert_hidden_dim is None
+                else moe_expert_hidden_dim
+            )
+            self.feed_forward = SparseMoE(
+                embedding_dim=embedding_dim,
+                expert_hidden_dim=resolved_expert_hidden_dim,
+                num_experts=moe_num_experts,
+                top_k=moe_top_k,
+                routing_bias_update_rate=moe_routing_bias_update_rate,
+            )
+        else:
+            self.feed_forward = FeedForwardNetwork(
+                embedding_dim=embedding_dim,
+                hidden_dim=feed_forward_dim,
+            )
 
     def forward(
         self,
@@ -1448,6 +1710,11 @@ class DeerlightGPTLanguageModel(nn.Module):
         rope_base: float = ROPE_BASE,
         rms_norm_eps: float = RMS_NORM_EPSILON,
         attention_backend: str = ATTENTION_BACKEND,
+        moe_layer_indices: tuple[int, ...] | list[int] | None = None,
+        moe_expert_hidden_dim: int | None = None,
+        moe_num_experts: int = 8,
+        moe_top_k: int = 2,
+        moe_routing_bias_update_rate: float = 1e-3,
     ) -> None:
         super().__init__()
 
@@ -1456,6 +1723,25 @@ class DeerlightGPTLanguageModel(nn.Module):
 
         self.block_size = block_size
         self.vocab_size = vocab_size
+
+        selected_moe_layers = set(moe_layer_indices or ())
+
+        if len(selected_moe_layers) != len(moe_layer_indices or ()):
+            raise ValueError("MoE Layer Indices must not contain duplicates.")
+
+        invalid_moe_layers = {
+            layer_index
+            for layer_index in selected_moe_layers
+            if not 0 <= layer_index < num_layers
+        }
+
+        if invalid_moe_layers:
+            raise ValueError(
+                "MoE Layer Indices are outside the Transformer stack: "
+                f"{sorted(invalid_moe_layers)}"
+            )
+
+        self.moe_layer_indices = tuple(sorted(selected_moe_layers))
 
         # Module 1: Represent Token Identity; RoPE is applied inside Attention.
         self.token_embedding_table = nn.Embedding(
@@ -1474,8 +1760,13 @@ class DeerlightGPTLanguageModel(nn.Module):
                 rope_base=rope_base,
                 rms_norm_eps=rms_norm_eps,
                 attention_backend=attention_backend,
+                use_moe=layer_index in selected_moe_layers,
+                moe_expert_hidden_dim=moe_expert_hidden_dim,
+                moe_num_experts=moe_num_experts,
+                moe_top_k=moe_top_k,
+                moe_routing_bias_update_rate=moe_routing_bias_update_rate,
             )
-            for _ in range(num_layers)
+            for layer_index in range(num_layers)
         ])
 
         # Module 3: Normalize the final internal Representation.
@@ -1757,6 +2048,57 @@ def verify_deerlight_gpt() -> None:
     assert generated.shape == (2, BLOCK_SIZE + 2)
 
 
+def verify_moe_deerlight_gpt() -> None:
+    """Check that selected Transformer Blocks replace Dense FFNs with MoE."""
+    vocab_size = 65
+    model = DeerlightGPTLanguageModel(
+        vocab_size=vocab_size,
+        embedding_dim=32,
+        num_heads=4,
+        num_layers=2,
+        block_size=16,
+        feed_forward_dim=96,
+        moe_layer_indices=(1,),
+        moe_expert_hidden_dim=16,
+        moe_num_experts=4,
+        moe_top_k=2,
+    )
+
+    assert isinstance(
+        model.transformer_blocks[0].feed_forward,
+        FeedForwardNetwork,
+    )
+    assert isinstance(
+        model.transformer_blocks[1].feed_forward,
+        SparseMoE,
+    )
+
+    token_ids = torch.randint(
+        low=0,
+        high=vocab_size,
+        size=(2, 8),
+    )
+    targets = torch.randint(
+        low=0,
+        high=vocab_size,
+        size=(2, 8),
+    )
+    logits, loss, _ = model(token_ids, targets)
+
+    assert logits.shape == (2, 8, vocab_size)
+    assert torch.isfinite(logits).all()
+    assert loss is not None
+    assert torch.isfinite(loss)
+
+    loss.backward()
+
+    sparse_moe = model.transformer_blocks[1].feed_forward
+    assert isinstance(sparse_moe, SparseMoE)
+    assert sparse_moe.last_load_counts.sum().item() == 2 * 8 * 2
+    assert sparse_moe.router.weight.grad is not None
+    assert torch.isfinite(sparse_moe.router.weight.grad).all()
+
+
 # -----------------------------------------------------------------------------
 # Milestone 7: Deerlight GPT Training and Evaluation
 # -----------------------------------------------------------------------------
@@ -1976,6 +2318,14 @@ def load_deerlight_checkpoint(
             "attention_backend",
             ATTENTION_BACKEND,
         ),
+        moe_layer_indices=model_config.get("moe_layer_indices"),
+        moe_expert_hidden_dim=model_config.get("moe_expert_hidden_dim"),
+        moe_num_experts=model_config.get("moe_num_experts", 8),
+        moe_top_k=model_config.get("moe_top_k", 2),
+        moe_routing_bias_update_rate=model_config.get(
+            "moe_routing_bias_update_rate",
+            1e-3,
+        ),
     ).to(device)
 
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -2044,6 +2394,9 @@ def main() -> None:
     verify_swiglu_feed_forward()
     print("All Milestone 13 SwiGLU checks passed.")
 
+    verify_sparse_moe()
+    print("All Milestone 16 Sparse MoE checks passed.")
+
     verify_multi_head_attention()
     print("All Milestone 4 checks passed.")
 
@@ -2055,6 +2408,9 @@ def main() -> None:
 
     verify_deerlight_gpt()
     print("All Milestone 6 checks passed.")
+
+    verify_moe_deerlight_gpt()
+    print("All Milestone 16 MoE integration checks passed.")
 
     # Reset the Random Seed so verification does not affect Training.
     torch.manual_seed(SEED)

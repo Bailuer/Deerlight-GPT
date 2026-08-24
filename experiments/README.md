@@ -21,3 +21,4 @@ Each experiment should record:
 - [SwiGLU Architecture Verification](swiglu-verification.md)
 - [Medium Capability Baseline](medium-capability-baseline.md)
 - [SDPA and Fused Attention](sdpa-fused-attention.md)
+- [Sparse MoE Architecture Verification](moe-verification.md)
