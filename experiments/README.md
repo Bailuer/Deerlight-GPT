@@ -22,3 +22,14 @@ Each experiment should record:
 - [Medium Capability Baseline](medium-capability-baseline.md)
 - [SDPA and Fused Attention](sdpa-fused-attention.md)
 - [Sparse MoE Architecture Verification](moe-verification.md)
+- [Dense vs Interleaved Sparse MoE Pilot](dense-vs-moe-pilot.md)
+- [Loss-Free MoE Routing Bias Ablation](moe-routing-bias-ablation.md)
+- [Mini IsoFLOP Scaling Pilot](isoflop-scaling-pilot.md)
+
+## Reproducible Benchmarks
+
+```powershell
+python experiments/benchmark_moe.py --steps 30 --batch-size 8
+python experiments/ablate_moe_routing_bias.py --steps 100 --batch-size 8
+python experiments/isoflop_scaling_pilot.py
+```

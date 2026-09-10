@@ -1,5 +1,7 @@
 # Deerlight GPT
 
+Learning progress, experiment evidence, review questions, and the next step are tracked in [LEARNING_LOG.md](LEARNING_LOG.md).
+
 Building a small decoder-only Transformer from first principles, then upgrading it with modern LLM techniques.
 
 > Status: work in progress. The first goal is a transparent character-level GPT that can train and generate text end to end.
@@ -132,6 +134,23 @@ Expert, loss-free Routing Bias updates, Expert Load monitoring, and weighted
 Scatter-Add combination. MoE can be enabled only on selected Transformer Blocks,
 while the default Dense path remains compatible with existing Checkpoints.
 
-Next: run a controlled Dense-vs-MoE Pilot with matched Active Hidden Capacity,
-then compare parameter count, throughput, memory, validation loss, and Expert
-utilization before enabling MoE in a longer training run.
+The first matched-Active-Capacity Pilot found 78.1% more Total Parameters and
+only 1.3% more estimated Active Parameters per Token, but the transparent MoE
+implementation delivered 57.4% lower throughput and 33.6% higher Peak VRAM than
+Dense. Thirty Steps were insufficient to establish a quality difference or
+improved Expert balance.
+
+A 100-Step MoE-vs-MoE Ablation then isolated loss-free Routing Bias updates.
+Rate `0.001` reduced cross-Layer Late Mean Load CV by 14.0% and Cumulative CV
+by 10.2% relative to Rate `0`, with only a 0.0012 Validation Loss difference.
+
+Next: sweep multiple Routing Bias Update Rates and Random Seeds, or return to
+the Modern Architecture curriculum and study Scaling Laws before committing to
+a longer MoE training run.
+
+The expanded Mini IsoFLOP Profile held approximate Dense Training Compute near
+`1.2e12 FLOPs` across five Model sizes. Validation Loss formed a U-shaped curve:
+the 55,793-Parameter Mini Model reached 2.0151, outperforming both a
+capacity-limited 16,641-Parameter Tiny Model and increasingly undertrained Models
+from 101K to 723K Parameters. This brackets a local Compute-Optimal region for
+the tested budget without claiming a universal optimum.
