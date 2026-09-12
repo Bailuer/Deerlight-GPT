@@ -1,14 +1,14 @@
 # Deerlight GPT — 学习档案
 
-最后更新：2026-09-11
+最后更新：2026-09-13
 
 ## 先看这里：我们现在在哪
 
 - 长期方向：从理解、实现小型 GPT，逐步发展到能提出问题、设计实验和解释结果的 LLM Research 能力。
-- 当前阶段：Byte-level BPE 已实现、分模块讲解，并接入独立的小 GPT Training Pipeline。
-- 最近完成：3,000 Steps BPE 实验；定期 Training/Validation Evaluation、Best/Final Checkpoint、Loss History 和 Generation。
+- 当前阶段：完成第一轮颜色翻译 SFT Pilot，准备分析记忆与新问法泛化的区别。
+- 最近完成：8 条训练题/4 条新问法的 800-Step SFT，EOS-stopped Generation、Exact Match 与 Best Checkpoint 重载验证。
 - 当前限制：生成仍有假词、不连贯，不能正常对话；未完成 Character/BPE 的公平质量比较。
-- 下一步建议（尚未执行）：先理解 BPB 的实际评估方式，再设计 Character/BPE 对照。不要直接比较两个 Tokenizer 的 per-token Loss。
+- 下一步：解释 Training 全对但新问法 red 错误的结果；讨论数据覆盖和独立 Test Set，不直接堆 Steps。Character/BPE 公平对照暂存。
 - 本档案是学习导航，不是能力认证。代码跑通 ≠ 学习者能独立实现；聊天中回答正确 ≠ 长期掌握。
 
 ## 怎么记录掌握程度
@@ -20,6 +20,75 @@
 - **有实现证据**：注明是自己写、辅助修改，还是由助手实现后阅读。
 - **有实验记录**：必须写配置、结果及结论边界。
 - **待复核**：以后用一个具体问题或小任务检查，不需要每次全部重考。
+
+## 学习路线
+
+勾选表示已完成当前阶段的学习环节，不等于每项都能独立实现；具体证据和待复习问题见后文。
+
+### Neural Network — 阶段完成
+
+- [x] Linear Model / Weight / Bias
+- [x] Loss / Gradient Descent / Chain Rule
+- [x] Batch Gradient Descent / Vectorization
+- [x] PyTorch / Autograd / Backpropagation
+- [x] Matrix Multiplication / Tensor Shapes
+- [x] ReLU / GELU / MLP
+- [x] Softmax / Cross-Entropy / Classification
+
+实际完成：手算 Gradient、NumPy Training Loop、Learning Rate Experiment、MLP 拟合绝对值、三分类训练。
+
+### Transformer — 阶段完成
+
+- [x] Tokenizer / Token Embedding / Position Embedding
+- [x] Shifted Batch / Next-token Prediction
+- [x] Q / K / V / Causal Self-Attention
+- [x] Multi-Head Attention / Output Projection
+- [x] FFN / LayerNorm / Residual Connection
+- [x] Decoder-only GPT / Training / Generation
+- [x] Temperature / Top-k / Checkpoint
+
+实际完成：Deerlight-GPT 本体、训练与生成、Shape/Causality 检查，以及代码数据流复盘。
+
+### Modern LLM Architecture — 阶段完成
+
+- [x] Transformer
+- [x] KV Cache
+- [x] GQA / MQA
+- [x] RoPE
+- [x] RMSNorm
+- [x] SwiGLU
+- [x] SDPA / FlashAttention Concepts
+- [x] MoE
+- [x] Scaling Laws（本阶段关联的 Training Topic）
+
+实际完成：
+
+- Deerlight-GPT Modern Dense Model
+- Sparse MoE Tensor Implementation
+- Loss-Free Routing Bias
+- GPU BF16 Verification
+- Dense vs MoE Controlled Experiment
+- Routing Bias Ablation
+- 五模型 IsoFLOP Profile
+- 在已测试配置中观察到 U-shaped Compute Allocation Curve
+
+“阶段完成”指上述约定范围，不代表所有现代架构都已学完。FlashAttention 为概念学习及现成 Backend 使用；IsoFLOP 结果不是普适最优规律的证明。
+
+### LLM Training Science — 进行中
+
+- [x] 小规模 Pretraining / AdamW / Gradient Clipping
+- [x] Controlled Experiments / Scaling Laws 入门
+- [x] Byte-level BPE / Tokenizer Integration
+- [x] Validation / Best Checkpoint / BPB Evaluation
+- [x] SFT Data Pipeline / Chat Format / Loss Masking / Padding（助手实现与测试；独立实现待验证）
+- [x] 小任务 SFT / EOS-stopped Generation / Exact Match Evaluation（不是通用 Chat 能力）
+- [ ] LoRA / QLoRA
+- [ ] Preference Learning / DPO
+- [ ] RL for LLMs / PPO / GRPO
+- [ ] Data Quality / Training Stability / Distributed Training
+- [ ] 独立论文复现与研究实验
+
+当前进度：小规模 Pretraining/Evaluation 与第一轮小任务 SFT 已走通，正在分析 SFT 泛化局限。
 
 ## 知识地图
 
@@ -41,7 +110,7 @@
 | MoE | 学过 Router、Top-k、Shared Experts、Load Balancing、Capacity、Dispatch/Combine；有辅助实现及实验 | 一个 Token 的完整 Representation 送入多个 Experts，Outputs 加权相加，不是切成两半或拼接 |
 | Scaling Laws | 做过固定近似 Compute 的配置比较；能指出变量和数据量限制 | 一次小实验不能得到普适 Scaling Law；重复数据不等于新知识 |
 | Byte-level BPE | 概念问答后，由助手完整实现并逐模块讲解；Round-trip/Save/Load 测试及真实 Dataset 实验 | 尚未验证独立实现；理解 Rank 而非 Encoding 时重新选择最高频 Pair |
-| Evaluation | 已讲 Uniform Baseline、per-token CE、BPB、Best Checkpoint | BPB 尚未实现；评估 Context 与原文范围也需统一 |
+| Evaluation | 已讲 Uniform Baseline、per-token CE、BPB、Best Checkpoint；助手实现并测试 BPE BPB | 需复述 Target Byte 分母与 Context Policy；跨 Tokenizer 的范围尚未统一 |
 
 ## 常见卡点：以后复习这些，而不是从头重学
 
@@ -98,7 +167,7 @@
 - Latest Run：`runs/bpe-model-20260911-035646/`；本档案已核对其中的 History。
 - 检查：Shifted Batch、Forward/Backward、Final Logits 重载一致、Best Loss 重载一致、Generation。
 - 结论：两条 Loss 持续下降，超过 Uniform；这段记录没有 Validation 回升。不能证明已学会长距离推理。
-- 局限：单 Seed、5 个固定评估 Batches、没有独立 Test Set；尚未测 BPB。生成仍有假词、不能对话。
+- 局限：单 Seed、训练过程使用 5 个固定评估 Batches、没有独立 Test Set；BPB 后续已补测，见更新记录。生成仍有假词、不能对话。
 - 保存的是 Tokenizer Rules + Model Config/Weights；旧 Character Checkpoints 不被替换。
 
 `runs/` 和 Checkpoints 被 Git 忽略：上传本档案不会上传 Weights/完整运行结果。上表保留关键摘要，重要本地产物另行备份。
@@ -106,9 +175,9 @@
 ## 下一次怎么接上
 
 1. 先读“我们现在在哪”，不从 Transformer 基础重复开始。
-2. 回顾一个问题：为什么当前 BPE 的 3.6100 不能直接和 Character Model 的 1.561 比？
-3. 实现 BPB Evaluation 前先约定同一原文、预测范围、Context Policy，避免无意改变比较口径。
-4. 若要做 Character/BPE 对照，先确定预算/架构控制；当前两个现成 Model 并非公平对照。
+2. 用户已正确回答：Assistant 仍预测下一个 Token；User Labels 忽略不影响问题可见性。用户主动联系 Backpropagation；已澄清更新的是 Parameters，不是输入文字，普通 Inference 不更新 Weights。
+3. 用户已理解 Labels/Prompt 与 Shift 区别；代码只讲核心。颜色 SFT 已跑完，下一步分析：训练 8/8、新问法 3/4，red 被答为绿色；Teacher-forced Loss 低不代表自由 Generation 全对。
+4. BPE/BPB 主流程暂告一段落。Character/BPE 公平对照留待后续，届时统一原文范围、Context Policy 与预算；不要重新强迫完成旧待办再继续 SFT。
 5. 暂不默认扩模型、重训 Tokenizer、长时间训练、删除 Checkpoint 或 Commit/Push；按当次请求执行。
 
 ## 维护约定
@@ -118,8 +187,19 @@
 - 用户表示“懂了”记为交流进展；独立解释/实现需有独立证据。
 - 代码由助手编写就明确记录，不作为学习者独立编码能力的证明。
 - 每次结束只留下一个清晰的下一步；新兴趣可以列为支线，不自动切换主线。
-- 支线兴趣：Agent Harness。曾讨论，尚未进入系统课程；与当前 BPE/GPT 主线区分。
+- 支线兴趣：Physical AI, Robotics。曾讨论，尚未进入系统课程；与当前 BPE/GPT 主线区分。
 
 ### 更新记录
 
+- 2026-09-13：助手实现并运行 `train_sft_colors.py`（800 Steps），见 `experiments/sft-colors.md`。Best Step 400，Train Loss=0.0076、Val Loss=0.0746；Train EM=8/8、Val EM=3/4，两边 EOS 均 100%。同四个颜色仅留出一个问法，非独立 Test；red 新问法错误。后期 Train Loss 降、Val Loss 升，不宣称通用翻译能力。12 项既有测试通过、Best 重载结果一致，旧 Checkpoint 未变；本地输出 `runs/sft-colors-20260913-045832/`。
+
+- 2026-09-13：助手新增 `sft_data.py` 和 `test_sft_data.py`；3 组测试通过：Shift/首回答 Token/EOS/Prompt Mask/Padding、空回答/Unicode/超长拒绝、实际 Model Loss 平均/Backward/Right Padding 不改变有效 Logits。仅 CPU 功能验证，无 Optimizer Update。角色标记使用普通文本、BOS/EOS/PAD 使用现有 IDs，不扩 Vocabulary；Prompt/Answer 分开 Encode，防止 Merge 跨监督边界。只支持 Single-turn、Right Padding，超长报错，不静默截断、不 Packing。Byte-only 演示 Shape `(2,41)`，两个有效 Target 数 6/13，总分母 19。用户独立实现未验证。
+
+- 2026-09-12：按用户要求新增勾选式学习路线，覆盖 Neural Network、Transformer、Modern Architecture 和 LLM Training Science。区分已讲/已做环节与独立掌握；列出 Modern Architecture 进阶候选及 Training Science 后续路线，不改变当前 SFT 优先级。
+
+- 2026-09-12：完成 Loss Masking 概念小节。记录上述问答证据；有效 Targets 才计入平均分母，User 部分不直接计 Loss 但相关运算可接收回答 Loss 的 Gradient。转入 Padding/Batch；未添加 SFT 代码或训练。
+
+- 2026-09-11：按用户决定进入 SFT/Chat Format。已介绍教学用 BOS、USER、EOT、ASSISTANT、EOS；新 Role IDs 尚未添加，未训练 SFT。新增 `AGENTS.md`，以小节/实验/章节事件驱动更新，约每 5 个实质教学轮次检查、约 8 轮未落档时补快照。
+
 - 2026-09-11：建立第一版；整理历史学习路径，核对最新 BPE History，列明掌握证据和待复核项。
+- 2026-09-11：实现 `evaluate_bpb.py`、`test_evaluate_bpb.py`。共 9 项 Tokenizer/BPB 测试通过。Step 3,000 Best 在 Validation 的 57,640 个 Targets、111,537 Bytes 上 BPB=2.719691；Uniform=4.651013。首 Token 的 3 Bytes 只作 Context、不计分。每 64 Targets 重置 Context（块间仅保留前一个 Token 作为首输入），不是 full sliding window。全范围 mean token NLL=3.647876，与之前 5 个随机固定 Batches 的 3.6100 不是相同评估样本。输出 `runs/bpb-20260911-041106/metrics.json`。尚未完成跨 Tokenizer 比较。
